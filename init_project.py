@@ -383,6 +383,9 @@ def main():
             "sustentacao_proj_dias":  2,        # C4 — mínimo de dias abaixo (janela 5d)
             "cooldown_h":             48,
             "snooze_dias":            5,
+            # Ajuste de vida pelo ano vigente: V = Eta - (d × w)
+            # 0.0 = só Weibull | 1.0 = só média do ano | 0.8 recomendado
+            "vida_decay_w":           0.8,
             # AMARELO — aviso precoce (C1_am OR C2_am)
             "amarelo_p_risk":         0.35,
             "amarelo_signal":         0.15,
