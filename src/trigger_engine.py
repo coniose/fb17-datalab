@@ -776,6 +776,9 @@ class TriggerEngine:
         self.weibull_eta_d   = self.weibull_eta_h / 24.0
         self.boost_sinal     = float(cfg.get("boost_sinal",   BOOST_SINAL))
         self.snooze_dias     = int(cfg.get("snooze_dias",     SNOOZE_DIAS))
+        # V = Eta - (d × w) onde d = Eta - mean_vida_ano_vigente.
+        # 0.0 = ignorar experiência recente; 1.0 = usar só média do ano.
+        self.vida_decay_w    = float(cfg.get("vida_decay_w",  0.8))
 
         # Gatilhos registrados — a ordem define a prioridade de avaliação
         self.triggers: List[TriggerBase] = [
@@ -797,6 +800,7 @@ class TriggerEngine:
         list_name: str = DEFAULT_LIST_NAME,
         today: Optional[pd.Timestamp] = None,
         media_col: str = "Media",
+        troca_dates: Optional[list] = None,
     ) -> List[TriggerEvent]:
         """
         Avalia todos os gatilhos para `today`.
@@ -842,13 +846,19 @@ class TriggerEngine:
             p_risk               = p_risk,
         )
 
+        # ── Vida de referência ajustada pela experiência do ano vigente ──────────
+        vida_ref_ajustada = (
+            self._compute_vida_ref_ajustada(troca_dates)
+            if troca_dates is not None else self.weibull_eta_d
+        )
+
         # ── Avaliação dos gatilhos ─────────────────────────────────────────────
         fired: List[TriggerEvent] = []
         for trigger in self.triggers:
             if trigger.check(features, self.state):
                 ev = trigger.build_event(self.maquina, features, self.state)
                 trigger.update_state(self.state, ev.data_disparo)
-                self._persist(ev, trigger, sp_client, list_name)
+                self._persist(ev, trigger, sp_client, list_name, vida_ref_ajustada)
                 fired.append(ev)
 
         _save_state(self.state, self.state_path)
@@ -909,10 +919,47 @@ class TriggerEngine:
         logger.info("RED (ID=%s) em snooze até %s.", sp_id, snooze_fim)
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Vida de referência ajustada pelo ano vigente
+    # ──────────────────────────────────────────────────────────────────────────
+    def _compute_vida_ref_ajustada(self, troca_dates: list) -> float:
+        """
+        V = Eta - (d × w)  onde  d = Eta - mean_vida_ano_vigente.
+
+        Reduz os "dias restantes" exibidos no card quando os ciclos do ano
+        vigente são mais curtos que a vida Weibull histórica, refletindo
+        degradação do processo produtivo.
+
+        Se não há ciclos completos no ano vigente, retorna weibull_eta_d
+        sem ajuste (fallback conservador).
+        """
+        if not troca_dates or len(troca_dates) < 2:
+            return self.weibull_eta_d
+
+        ano = datetime.now().year
+        sorted_dates = sorted(troca_dates)
+
+        duracoes = []
+        for i in range(1, len(sorted_dates)):
+            inicio = sorted_dates[i - 1]
+            fim    = sorted_dates[i]
+            if _to_utc(fim).year == ano:
+                dur = (_to_utc(fim) - _to_utc(inicio)).total_seconds() / 86400.0
+                if dur > 0:
+                    duracoes.append(dur)
+
+        if not duracoes:
+            return self.weibull_eta_d
+
+        mean_ano = sum(duracoes) / len(duracoes)
+        d = self.weibull_eta_d - mean_ano   # positivo = ciclos mais curtos que Eta
+        v = self.weibull_eta_d - d * self.vida_decay_w
+        return max(1.0, v)
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Persistência no SharePoint
     # ──────────────────────────────────────────────────────────────────────────
     def _persist(self, ev: TriggerEvent, trigger: TriggerBase,
-                 sp_client, list_name: str) -> None:
+                 sp_client, list_name: str, vida_ref_dias: float = 0.0) -> None:
         if sp_client is None:
             logger.warning("[dry-run] %s nao persistido (sp_client=None).", ev.gatilho)
             return
@@ -929,6 +976,7 @@ class TriggerEngine:
                 proj_48h         = ev.proj_48h,
                 acao_recomendada = ev.acao_recomendada,
                 data_disparo     = datetime.fromisoformat(ev.data_disparo[:19]),
+                vida_ref_dias    = vida_ref_dias or self.weibull_eta_d,
             )
         except Exception as exc:
             logger.warning("card_formatter falhou (%s) — TeamsPayload omitido.", exc)

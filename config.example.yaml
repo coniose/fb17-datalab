@@ -50,6 +50,12 @@ trigger:
   sustentacao_proj_dias: 2      # C4: mínimo de dias abaixo do limiar (janela 5d)
   cooldown_h: 48                # horas de silêncio após disparo RED
   snooze_dias: 5                # dias de snooze após confirmação do operador
+  # ── Ajuste de vida de referência pelo ano vigente ─────────────────────────
+  # V = Eta - (d × w)  |  d = Eta_dias - mean_vida_ano_vigente
+  # 0.0 = ignora experiência recente (só Weibull)
+  # 1.0 = usa somente a média do ano vigente
+  # Recomendado: 0.8 — responde bem a anos com degradação acelerada
+  vida_decay_w: 0.8
 
   # ── Gatilho AMARELO — anomalia detectada (aviso precoce) ──────────────────
   amarelo_p_risk: 0.35          # p_risk suficiente para aviso amarelo
