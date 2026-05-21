@@ -1,0 +1,6 @@
+seeq
+pandas
+numpy
+scikit-learn
+matplotlib
+pyyaml
