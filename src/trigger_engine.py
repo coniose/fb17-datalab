@@ -247,34 +247,37 @@ def _align_tz(ts: pd.Timestamp, index: pd.DatetimeIndex) -> pd.Timestamp:
     return ts.tz_localize(index.tz) if ts.tzinfo is None else ts.tz_convert(index.tz)
 
 
+_DAY_END = pd.Timedelta(hours=23, minutes=59)   # inclui intradiário do dia atual
+
+
 def _rolling_mean(df: pd.DataFrame, col: str, ref: pd.Timestamp, days: int) -> float:
     t = _align_tz(ref, df.index)
-    sub = df.loc[t - pd.Timedelta(days=days):t, col].dropna()
+    sub = df.loc[t - pd.Timedelta(days=days) : t + _DAY_END, col].dropna()
     return float(sub.mean()) if len(sub) > 0 else float("nan")
 
 
 def _rolling_min(df: pd.DataFrame, col: str, today: pd.Timestamp, days: int) -> float:
     t = _align_tz(today, df.index)
-    sub = df.loc[t - pd.Timedelta(days=days):t, col].dropna()
+    sub = df.loc[t - pd.Timedelta(days=days) : t + _DAY_END, col].dropna()
     return float(sub.min()) if len(sub) > 0 else float("nan")
 
 
 def _rolling_median(df: pd.DataFrame, col: str, today: pd.Timestamp, days: int) -> float:
     t = _align_tz(today, df.index)
-    sub = df.loc[t - pd.Timedelta(days=days):t, col].dropna()
+    sub = df.loc[t - pd.Timedelta(days=days) : t + _DAY_END, col].dropna()
     return float(sub.median()) if len(sub) > 0 else float("nan")
 
 
 def _count_below(df: pd.DataFrame, col: str, today: pd.Timestamp,
                  days: int, threshold: float) -> int:
     t = _align_tz(today, df.index)
-    sub = df.loc[t - pd.Timedelta(days=days):t, col].dropna()
+    sub = df.loc[t - pd.Timedelta(days=days) : t + _DAY_END, col].dropna()
     return int((sub < threshold).sum())
 
 
 def _date_of_min(df: pd.DataFrame, col: str, today: pd.Timestamp, days: int) -> str:
     t = _align_tz(today, df.index)
-    sub = df.loc[t - pd.Timedelta(days=days):t, col].dropna()
+    sub = df.loc[t - pd.Timedelta(days=days) : t + _DAY_END, col].dropna()
     if len(sub) == 0:
         return today.date().isoformat()
     return sub.idxmin().date().isoformat()
@@ -282,7 +285,7 @@ def _date_of_min(df: pd.DataFrame, col: str, today: pd.Timestamp, days: int) -> 
 
 def _slope_7d(df: pd.DataFrame, col: str, today: pd.Timestamp) -> float:
     t = _align_tz(today, df.index)
-    sub = df.loc[t - pd.Timedelta(days=JANELA_SLOPE_D):t, col].dropna()
+    sub = df.loc[t - pd.Timedelta(days=JANELA_SLOPE_D) : t + _DAY_END, col].dropna()
     if len(sub) < 2:
         return 0.0
     x = (sub.index - sub.index[0]).total_seconds().values / 86400.0
@@ -410,8 +413,6 @@ class RiscoTrigger(TriggerBase):
         self.cooldown_h   = float(cfg.get("risco_cooldown_h",   RISCO_COOLDOWN_H))
 
     def check(self, features: TriggerFeatures, state: dict) -> bool:
-        if features.age_days < 5:
-            return False
         if np.isnan(features.min_3d) or features.min_3d >= self.forca_limiar:
             return False
         if features.n_leituras_abaixo_800 > self.n_max:
