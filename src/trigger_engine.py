@@ -974,9 +974,7 @@ class TriggerEngine:
     def _persist(self, ev: TriggerEvent, trigger: TriggerBase,
                  features: TriggerFeatures, sp_client, list_name: str,
                  eta_ajustado_dias: float = 0.0) -> None:
-        if sp_client is None:
-            logger.warning("[dry-run] %s não persistido (sp_client=None).", ev.gatilho)
-            return
+        # Monta o payload sempre — necessário mesmo em dry-run para diagnóstico
         try:
             if ev.gatilho in ("RISCO", "CRITICO", "EMERGENCIAL"):
                 ev.teams_payload = _build_card_json(ev, features)
@@ -996,6 +994,10 @@ class TriggerEngine:
                 )
         except Exception as exc:
             logger.warning("card build falhou (%s) — TeamsPayload omitido.", exc)
+
+        if sp_client is None:
+            logger.warning("[dry-run] %s não persistido (sp_client=None).", ev.gatilho)
+            return
 
         _SP_CAMPOS_ATIVOS = {"Title", "Maquina", "TeamsPayload"}
         sp_payload = {k: v for k, v in ev.to_sp_dict().items()
