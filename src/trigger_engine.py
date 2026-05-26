@@ -145,6 +145,7 @@ class TriggerFeatures:
     mediana_3d: float
     n_leituras_abaixo_800: int
     slope_7d: float
+    slope_min_ciclo: float
     proj_48h: float
     sig_score: float
     age_risk: float
@@ -303,12 +304,34 @@ def _weibull_age_risk(age_days: float, beta: float = WEIBULL_BETA,
     return float(1.0 - np.exp(-((age_days / eta_d) ** beta)))
 
 
-def _compute_signal_score(mean_3d: float, mean_14d: float, slope_7d: float,
+def _min_slope_ciclo(df: pd.DataFrame, col: str,
+                     cycle_start: pd.Timestamp, today: pd.Timestamp) -> float:
+    """Worst (most negative) 7d slope observed since cycle_start.
+
+    Physical justification: the roll degrades monotonically — force recovery
+    is transient noise, not material recovery. The minimum slope is the best
+    estimate of the true underlying degradation rate.
+
+    Only considers windows fully within the cycle (starts at cycle_start + 7d).
+    Falls back to the current slope when the cycle is younger than 7 days.
+    """
+    first_valid = cycle_start + pd.Timedelta(days=JANELA_SLOPE_D)
+    if first_valid > today:
+        return _slope_7d(df, col, today)
+    slopes = []
+    t = first_valid
+    while t <= today:
+        slopes.append(_slope_7d(df, col, t))
+        t += pd.Timedelta(days=1)
+    return min(slopes)
+
+
+def _compute_signal_score(mean_3d: float, mean_14d: float, slope_for_danger: float,
                            boost: float = BOOST_SINAL) -> float:
     if np.isnan(mean_3d) or np.isnan(mean_14d) or mean_14d == 0:
         return 0.0
     deg_signal   = max(0.0, 1.0 - mean_3d / mean_14d)
-    slope_danger = float(np.clip(-slope_7d / 50.0, 0.0, 1.0))
+    slope_danger = float(np.clip(-slope_for_danger / 50.0, 0.0, 1.0))
     return float(deg_signal * 0.6 + slope_danger * 0.4)
 
 
@@ -878,8 +901,9 @@ class TriggerEngine:
         _ciclo_media   = df_hourly.loc[df_hourly.index >= troca_date, "Media"].dropna()
         forca_min_ciclo = float(_ciclo_media.min()) if len(_ciclo_media) > 0 else float("nan")
         slope          = _slope_7d(df_hourly, media_col, today)
+        slope_min      = _min_slope_ciclo(df_hourly, media_col, troca_date, today)
         proj_48h       = _compute_proj_48h(mean_3d, slope)
-        sig_score      = _compute_signal_score(mean_3d, mean_14d, slope)
+        sig_score      = _compute_signal_score(mean_3d, mean_14d, slope_min)
         age_risk       = _weibull_age_risk(age_days, self.weibull_beta, self.weibull_eta_d)
         p_risk         = age_risk + (1.0 - age_risk) * sig_score * self.boost_sinal
 
@@ -894,6 +918,7 @@ class TriggerEngine:
             mediana_3d            = mediana_3d,
             n_leituras_abaixo_800 = n_abaixo,
             slope_7d              = slope,
+            slope_min_ciclo       = slope_min,
             proj_48h              = proj_48h,
             sig_score             = sig_score,
             age_risk              = age_risk,
@@ -1052,8 +1077,9 @@ def compute_p_risk_snapshot(
     mediana_3d = _rolling_median(df, "Media", today, JANELA_MEAN_3D)
     n_abaixo   = _count_below(df, "Media", today, JANELA_MEAN_3D, RISCO_FORCA_LIMIAR)
     slope      = _slope_7d(df, "Media", today)
+    slope_min  = _min_slope_ciclo(df, "Media", troca_date, today)
     proj_48h   = _compute_proj_48h(mean_3d, slope)
-    sig_score  = _compute_signal_score(mean_3d, mean_14d, slope)
+    sig_score  = _compute_signal_score(mean_3d, mean_14d, slope_min)
     age_risk   = _weibull_age_risk(age_days)
     p_risk     = age_risk + (1.0 - age_risk) * sig_score * BOOST_SINAL
     ratio_3_14 = (mean_3d / mean_14d) if (not np.isnan(mean_14d) and mean_14d > 0) else float("nan")
@@ -1074,7 +1100,8 @@ def compute_p_risk_snapshot(
         "mediana_3d":            round(mediana_3d, 1) if not np.isnan(mediana_3d) else None,
         "n_leituras_abaixo_800": n_abaixo,
         "ratio_3_14":            round(ratio_3_14, 4) if not np.isnan(ratio_3_14) else None,
-        "slope_7d":              round(slope,    1),
+        "slope_7d":              round(slope,       1),
+        "slope_min_ciclo":       round(slope_min,   1),
         "proj_48h":              round(proj_48h, 1) if not np.isnan(proj_48h) else None,
         "age_risk":              round(age_risk,  4),
         "sig_score":             round(sig_score, 4),

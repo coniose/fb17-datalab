@@ -42,8 +42,8 @@ def _label_tendencia(slope_n_por_dia: Optional[float]) -> str:
         return f"▼▼ Declínio acentuado ({val})"
     if slope_n_por_dia < -3:
         return f"▼ Declínio leve ({val})"
-    if slope_n_por_dia > 3:
-        return f"▲ Recuperando ({val})"
+    # Slope positivo é ruído AR(1), não recuperação material — o rolo só degrada.
+    # Recuperação real implica troca de rolo (novo ciclo).
     return f"→ Estável ({val})"
 
 
