@@ -1020,8 +1020,37 @@ class TriggerEngine:
                     data_disparo       = datetime.fromisoformat(ev.data_disparo[:19]),
                     media_3d           = features.mean_3d,
                 )
-            elif ev.gatilho in ("CRITICO", "EMERGENCIAL"):
-                ev.teams_payload = _build_card_json(ev, features)
+            elif ev.gatilho == "CRITICO":
+                from .card_formatter import build_critico_card
+                ev.teams_payload = build_critico_card(
+                    maquina             = ev.maquina,
+                    idade_dias          = ev.idade_maintacker,
+                    p_risk              = features.p_risk,
+                    slope_7d            = ev.slope_forca_7d,
+                    forca_min_3d        = features.min_3d if not np.isnan(features.min_3d) else None,
+                    proj_48h            = features.proj_48h if not np.isnan(features.proj_48h) else None,
+                    media_7d            = features.mean_7d if not np.isnan(features.mean_7d) else None,
+                    media_7d_anterior   = features.mean_7d_3d_ago if not np.isnan(features.mean_7d_3d_ago) else None,
+                    acao_recomendada    = ev.acao_recomendada,
+                    data_disparo        = datetime.fromisoformat(ev.data_disparo[:19]),
+                    vida_ref_dias       = eta_ajustado_dias or self.weibull_eta_d,
+                    eventos_risco_ciclo = ev.evento_no_ciclo,
+                )
+            elif ev.gatilho == "EMERGENCIAL":
+                from .card_formatter import build_emergencial_card
+                ev.teams_payload = build_emergencial_card(
+                    maquina             = ev.maquina,
+                    idade_dias          = ev.idade_maintacker,
+                    p_risk              = features.p_risk,
+                    slope_7d            = ev.slope_forca_7d,
+                    forca_min_3d        = features.min_3d if not np.isnan(features.min_3d) else None,
+                    proj_48h            = features.proj_48h if not np.isnan(features.proj_48h) else None,
+                    media_7d            = features.mean_7d if not np.isnan(features.mean_7d) else None,
+                    acao_recomendada    = ev.acao_recomendada,
+                    data_disparo        = datetime.fromisoformat(ev.data_disparo[:19]),
+                    vida_ref_dias       = eta_ajustado_dias or self.weibull_eta_d,
+                    eventos_risco_ciclo = features.eventos_risco_ciclo,
+                )
             else:
                 from .card_formatter import build_alert_card
                 ev.teams_payload = build_alert_card(
