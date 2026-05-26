@@ -993,6 +993,7 @@ class TriggerEngine:
                     n_abaixo_800_ciclo = ev.evento_no_ciclo,
                     p_risk             = features.p_risk,
                     data_disparo       = datetime.fromisoformat(ev.data_disparo[:19]),
+                    media_3d           = features.mean_3d,
                 )
             elif ev.gatilho in ("CRITICO", "EMERGENCIAL"):
                 ev.teams_payload = _build_card_json(ev, features)

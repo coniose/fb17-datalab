@@ -213,7 +213,6 @@ def build_alert_card(
             {"title": "Força Projetada (48h)",  "value": forca_proj_str},
             {"title": "< 800 gf no ciclo",       "value": abaixo_str},
             {"title": "Tendência de Força",     "value": _label_tendencia(slope_7d)},
-            {"title": "Risco de Parada",        "value": _label_risco(p_risk)},
         ]
     elif gatilho in ("AMARELO", "RED"):
         indicadores_facts = [
@@ -222,14 +221,12 @@ def build_alert_card(
             {"title": "Força Mínima (3 dias)",  "value": forca_min_str},
             {"title": "Força Mínima do Ciclo",  "value": forca_min_ciclo_str},
             {"title": "< 800 gf no ciclo",       "value": abaixo_str},
-            {"title": "Risco de Parada",        "value": _label_risco(p_risk)},
         ]
     else:
         indicadores_facts = [
             {"title": "Tendência de Força",     "value": _label_tendencia(slope_7d)},
             {"title": "Força Projetada (48h)",  "value": forca_proj_str},
             {"title": "Força Mínima (3 dias)",  "value": forca_min_str},
-            {"title": "Risco de Parada",        "value": _label_risco(p_risk)},
         ]
 
     card = {
@@ -448,6 +445,7 @@ def build_risco_card(
     n_abaixo_800_ciclo: int,
     p_risk: float,
     data_disparo: Optional[datetime] = None,
+    media_3d: Optional[float] = None,
     acao_recomendada: str = (
         "Ir ao local e verificar os motivos da força de selagem abaixo de 800 gf. "
         "Rolo novo — sem degradação associada."
@@ -469,7 +467,8 @@ def build_risco_card(
     except Exception:
         data_evento_fmt = data_forca_min
 
-    forca_str = f"{round(forca_min)} gf" if not math.isnan(forca_min) else "—"
+    forca_str    = f"{round(forca_min)} gf"  if not math.isnan(forca_min) else "—"
+    media_3d_str = f"{round(media_3d)} gf"  if media_3d is not None and not math.isnan(media_3d) else "—"
 
     card = {
         "type": "AdaptiveCard",
@@ -557,6 +556,10 @@ def build_risco_card(
                                 "value": forca_str,
                             },
                             {
+                                "title": "Força média (3 dias)",
+                                "value": media_3d_str,
+                            },
+                            {
                                 "title": "Data do evento",
                                 "value": data_evento_fmt,
                             },
@@ -587,10 +590,6 @@ def build_risco_card(
                             {
                                 "title": "Dias em operação",
                                 "value": f"{idade_dias} dias",
-                            },
-                            {
-                                "title": "Risco de parada",
-                                "value": _label_risco(p_risk),
                             },
                         ],
                     },
