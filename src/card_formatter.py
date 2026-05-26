@@ -18,10 +18,11 @@ from typing import Optional
 VIDA_REF_DIAS: float = 45.0
 
 _SEVERIDADE_META = {
-    "RED":        {"style": "attention", "titulo": "🔴 ALERTA VERMELHO"},
-    "AMARELO":    {"style": "warning",   "titulo": "🟡 ALERTA AMARELO"},
-    "EMERGENCIA": {"style": "attention", "titulo": "🚨 EMERGÊNCIA"},
-    "REVISAO":    {"style": "accent",    "titulo": "📋 REVISÃO DE CICLO"},
+    "RED":        {"style": "default",   "titulo": "⚫ FIM DE VIDA DO MAINTACKER",  "bg": "#1a1a1a"},
+    "AMARELO":    {"style": "attention", "titulo": "🔴 ALERTA CRÍTICO",             "bg": None},
+    "EMERGENCIA": {"style": "attention", "titulo": "🚨 EMERGÊNCIA",                 "bg": None},
+    "REVISAO":    {"style": "accent",    "titulo": "📋 REVISÃO DE CICLO",           "bg": None},
+    "RISCO":      {"style": "warning",   "titulo": "⚠️ RISCO — Leitura Anômala",   "bg": None},
 }
 
 _BAR_WIDTH = 20  # caracteres de largura da barra de vida
@@ -36,13 +37,14 @@ def _barra_vida(consumida: float) -> str:
 def _label_tendencia(slope_n_por_dia: Optional[float]) -> str:
     if slope_n_por_dia is None:
         return "—"
+    val = f"{slope_n_por_dia:+.0f} gf/dia"
     if slope_n_por_dia < -10:
-        return "▼▼ Declínio acentuado"
+        return f"▼▼ Declínio acentuado ({val})"
     if slope_n_por_dia < -3:
-        return "▼ Declínio leve"
+        return f"▼ Declínio leve ({val})"
     if slope_n_por_dia > 3:
-        return "▲ Recuperando"
-    return "→ Estável"
+        return f"▲ Recuperando ({val})"
+    return f"→ Estável ({val})"
 
 
 def _label_risco(p_risk: float) -> str:
@@ -92,10 +94,10 @@ def build_ai_prompt(
     age_risk_pct = round(age_risk * 100, 1)
     p_risk_pct = round(p_risk * 100, 1)
 
-    slope_str = f"{slope_7d:+.1f} N/dia" if slope_7d is not None else "—"
+    slope_str = f"{slope_7d:+.1f} gf/dia" if slope_7d is not None else "—"
     tendencia = _label_tendencia(slope_7d)
-    forca_min_str = f"{round(forca_min_3d)} N" if forca_min_3d is not None else "—"
-    proj_str = f"{round(proj_48h)} N" if proj_48h is not None else "—"
+    forca_min_str = f"{round(forca_min_3d)} gf" if forca_min_3d is not None else "—"
+    proj_str = f"{round(proj_48h)} gf" if proj_48h is not None else "—"
 
     # Significado histórico: em quantos % dos ciclos a troca ocorreu antes desta idade
     pct_ciclos_mais_curtos = round(
@@ -122,8 +124,8 @@ def build_ai_prompt(
         f"     → p_risk atual: {p_risk_pct}%",
         "",
         "━━━ LIMITES OPERACIONAIS DA MÁQUINA FB14 ━━━",
-        "  EMERGÊNCIA : força mínima (3d) < 800 N → intervenção imediata",
-        "  RED        : p_risk ≥ 48% E signal ≥ 22% E projeção 48h < 800 N (≥2 dias consecutivos)",
+        "  EMERGÊNCIA : força mínima (3d) < 800 gf → intervenção imediata",
+        "  RED        : p_risk ≥ 48% E signal ≥ 22% E projeção 48h < 800 gf (≥2 dias consecutivos)",
         "  AMARELO    : p_risk ≥ 35% OU signal ≥ 15% (aviso precoce)",
         "  REVISÃO    : marcos automáticos nos dias 20, 25 e 35 do ciclo",
         "  Cooldown   : RED 48h | AMARELO 72h | EMERGÊNCIA 48h | Snooze pós-OK: 5 dias",
@@ -141,7 +143,7 @@ def build_ai_prompt(
         f"  Gatilho ativo      : {gatilho}",
         f"  p_risk             : {p_risk_pct}% ({_label_risco(p_risk).split('(')[0].strip()})",
         f"  Slope força 7d     : {slope_str} ({tendencia})",
-        f"  Força mínima (3d)  : {forca_min_str}  [limite crítico: 800 N]",
+        f"  Força mínima (3d)  : {forca_min_str}  [limite crítico: 800 gf]",
         f"  Projeção 48h       : {proj_str}",
         f"  Ação recomendada   : {acao_recomendada}",
         "",
@@ -151,7 +153,7 @@ def build_ai_prompt(
         f"1. O que um p_risk de {p_risk_pct}% aos {idade_dias} dias de ciclo representa",
         f"   nos registros históricos desta máquina? Qual foi o desfecho típico?",
         f"2. Considerando slope de {slope_str} e projeção de {proj_str} em 48h,",
-        f"   quanto tempo temos antes de atingir o limite crítico de 800 N?",
+        f"   quanto tempo temos antes de atingir o limite crítico de 800 gf?",
         f"3. Como devemos operar nas próximas 48h para evitar parada não planejada?",
         f"4. Existe algum padrão de degradação documentado que corresponda a este cenário?",
     ]
@@ -169,6 +171,8 @@ def build_alert_card(
     acao_recomendada: str,
     data_disparo: Optional[datetime] = None,
     vida_ref_dias: float = VIDA_REF_DIAS,
+    n_abaixo_800_ciclo: int = 0,
+    forca_min_ciclo: Optional[float] = None,
 ) -> str:
     """
     Retorna JSON string do Adaptive Card pronto para o campo TeamsPayload.
@@ -178,7 +182,7 @@ def build_alert_card(
         gatilho         → RED | AMARELO | EMERGENCIA | REVISAO
         idade_dias      → IdadeMaintacker
         p_risk          → ScoreAtual
-        slope_7d        → SlopeForca7d  (N/dia — negativo = declinando)
+        slope_7d        → SlopeForca7d  (gf/dia — negativo = declinando)
         forca_min_3d    → ForcaMinima3d (N)
         proj_48h        → proj_48h (N)
         acao_recomendada→ AcaoRecomendada
@@ -193,8 +197,40 @@ def build_alert_card(
 
     data_str = (data_disparo or datetime.now()).strftime("%d/%m/%Y %H:%M")
 
-    forca_proj_str = f"{round(proj_48h)} N" if proj_48h is not None else "—"
-    forca_min_str  = f"{round(forca_min_3d)} N" if forca_min_3d is not None else "—"
+    forca_proj_str     = f"{round(proj_48h)} gf"         if proj_48h is not None else "—"
+    forca_min_str      = f"{round(forca_min_3d)} gf"     if forca_min_3d is not None else "—"
+    forca_min_ciclo_str = (
+        f"{round(forca_min_ciclo)} gf"
+        if forca_min_ciclo is not None and not math.isnan(forca_min_ciclo)
+        else "—"
+    )
+    abaixo_str = f"{n_abaixo_800_ciclo}x" if n_abaixo_800_ciclo > 0 else "Nenhuma"
+
+    if gatilho == "REVISAO":
+        indicadores_facts = [
+            {"title": "Força Mínima (3 dias)",  "value": forca_min_str},
+            {"title": "Força Mínima do Ciclo",  "value": forca_min_ciclo_str},
+            {"title": "Força Projetada (48h)",  "value": forca_proj_str},
+            {"title": "< 800 gf no ciclo",       "value": abaixo_str},
+            {"title": "Tendência de Força",     "value": _label_tendencia(slope_7d)},
+            {"title": "Risco de Parada",        "value": _label_risco(p_risk)},
+        ]
+    elif gatilho in ("AMARELO", "RED"):
+        indicadores_facts = [
+            {"title": "Tendência de Força",     "value": _label_tendencia(slope_7d)},
+            {"title": "Força Projetada (48h)",  "value": forca_proj_str},
+            {"title": "Força Mínima (3 dias)",  "value": forca_min_str},
+            {"title": "Força Mínima do Ciclo",  "value": forca_min_ciclo_str},
+            {"title": "< 800 gf no ciclo",       "value": abaixo_str},
+            {"title": "Risco de Parada",        "value": _label_risco(p_risk)},
+        ]
+    else:
+        indicadores_facts = [
+            {"title": "Tendência de Força",     "value": _label_tendencia(slope_7d)},
+            {"title": "Força Projetada (48h)",  "value": forca_proj_str},
+            {"title": "Força Mínima (3 dias)",  "value": forca_min_str},
+            {"title": "Risco de Parada",        "value": _label_risco(p_risk)},
+        ]
 
     card = {
         "type": "AdaptiveCard",
@@ -205,6 +241,7 @@ def build_alert_card(
             {
                 "type": "Container",
                 "style": meta["style"],
+                **({"backgroundColor": meta["bg"]} if meta.get("bg") else {}),
                 "bleed": True,
                 "items": [
                     {
@@ -329,24 +366,7 @@ def build_alert_card(
                     },
                     {
                         "type": "FactSet",
-                        "facts": [
-                            {
-                                "title": "Tendência de Força",
-                                "value": _label_tendencia(slope_7d),
-                            },
-                            {
-                                "title": "Força Projetada (48h)",
-                                "value": forca_proj_str,
-                            },
-                            {
-                                "title": "Força Mínima (3 dias)",
-                                "value": forca_min_str,
-                            },
-                            {
-                                "title": "Risco de Parada",
-                                "value": _label_risco(p_risk),
-                            },
-                        ],
+                        "facts": indicadores_facts,
                     },
                 ],
             },
@@ -420,6 +440,192 @@ def build_alert_card(
     return json.dumps(card, ensure_ascii=False, indent=2)
 
 
+def build_risco_card(
+    maquina: str,
+    idade_dias: int,
+    forca_min: float,
+    data_forca_min: str,
+    n_abaixo_800_ciclo: int,
+    p_risk: float,
+    data_disparo: Optional[datetime] = None,
+    acao_recomendada: str = (
+        "Ir ao local e verificar os motivos da força de selagem abaixo de 800 gf. "
+        "Rolo novo — sem degradação associada."
+    ),
+) -> str:
+    """
+    Adaptive Card para gatilho RISCO: leitura isolada abaixo de 800 gf em rolo sem degradação.
+
+    Parâmetros:
+        forca_min          → features.min_3d (N)
+        data_forca_min     → features.data_forca_min ("YYYY-MM-DD")
+        n_abaixo_800_ciclo → ev.evento_no_ciclo (Nº acumulado no ciclo)
+        p_risk             → features.p_risk (baixo — sem degradação)
+    """
+    data_str = (data_disparo or datetime.now()).strftime("%d/%m/%Y %H:%M")
+
+    try:
+        data_evento_fmt = datetime.strptime(data_forca_min, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        data_evento_fmt = data_forca_min
+
+    forca_str = f"{round(forca_min)} gf" if not math.isnan(forca_min) else "—"
+
+    card = {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.4",
+        "body": [
+            # ── Cabeçalho ─────────────────────────────────────────
+            {
+                "type": "Container",
+                "style": "warning",
+                "bleed": True,
+                "items": [
+                    {
+                        "type": "ColumnSet",
+                        "columns": [
+                            {
+                                "type": "Column",
+                                "width": "stretch",
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": "⚠️ RISCO — Leitura Anômala",
+                                        "weight": "Bolder",
+                                        "size": "Large",
+                                        "color": "Light",
+                                        "wrap": True,
+                                    },
+                                    {
+                                        "type": "TextBlock",
+                                        "text": "Força de Selagem — Rolo Maintacker",
+                                        "color": "Light",
+                                        "isSubtle": True,
+                                        "spacing": "None",
+                                        "wrap": True,
+                                    },
+                                ],
+                            },
+                            {
+                                "type": "Column",
+                                "width": "auto",
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": maquina,
+                                        "weight": "Bolder",
+                                        "size": "ExtraLarge",
+                                        "color": "Light",
+                                        "horizontalAlignment": "Right",
+                                    },
+                                    {
+                                        "type": "TextBlock",
+                                        "text": data_str,
+                                        "color": "Light",
+                                        "isSubtle": True,
+                                        "horizontalAlignment": "Right",
+                                        "spacing": "None",
+                                        "size": "Small",
+                                    },
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            },
+
+            # ── Evento ────────────────────────────────────────────
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "spacing": "Medium",
+                "items": [
+                    {
+                        "type": "TextBlock",
+                        "text": "EVENTO",
+                        "weight": "Bolder",
+                        "size": "Small",
+                        "isSubtle": True,
+                        "spacing": "Small",
+                    },
+                    {
+                        "type": "FactSet",
+                        "facts": [
+                            {
+                                "title": "Força mínima registrada",
+                                "value": forca_str,
+                            },
+                            {
+                                "title": "Data do evento",
+                                "value": data_evento_fmt,
+                            },
+                            {
+                                "title": "< 800 gf no ciclo",
+                                "value": f"{n_abaixo_800_ciclo}x",
+                            },
+                        ],
+                    },
+                ],
+            },
+
+            # ── Status do rolo ────────────────────────────────────
+            {
+                "type": "Container",
+                "spacing": "Medium",
+                "items": [
+                    {
+                        "type": "TextBlock",
+                        "text": "STATUS DO ROLO",
+                        "weight": "Bolder",
+                        "size": "Small",
+                        "isSubtle": True,
+                    },
+                    {
+                        "type": "FactSet",
+                        "facts": [
+                            {
+                                "title": "Dias em operação",
+                                "value": f"{idade_dias} dias",
+                            },
+                            {
+                                "title": "Risco de parada",
+                                "value": _label_risco(p_risk),
+                            },
+                        ],
+                    },
+                ],
+            },
+
+            # ── Ação recomendada ───────────────────────────────────
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "spacing": "Medium",
+                "items": [
+                    {
+                        "type": "TextBlock",
+                        "text": "AÇÃO RECOMENDADA",
+                        "weight": "Bolder",
+                        "size": "Small",
+                        "isSubtle": True,
+                        "spacing": "Small",
+                    },
+                    {
+                        "type": "TextBlock",
+                        "text": acao_recomendada,
+                        "wrap": True,
+                        "weight": "Bolder",
+                        "spacing": "Small",
+                    },
+                ],
+            },
+        ],
+    }
+
+    return json.dumps(card, ensure_ascii=False, indent=2)
+
+
 # ── Teste com dados sintéticos ─────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -436,7 +642,7 @@ if __name__ == "__main__":
                 proj_48h=870.0,
                 acao_recomendada=(
                     "Programar troca preventiva do rolo maintacker esta semana. "
-                    "Força abaixo de 800 N pode causar falhas de selagem com impacto "
+                    "Força abaixo de 800 gf pode causar falhas de selagem com impacto "
                     "direto na qualidade do produto."
                 ),
                 data_disparo=datetime(2026, 5, 12, 14, 35),
@@ -471,7 +677,7 @@ if __name__ == "__main__":
                 proj_48h=765.0,
                 acao_recomendada=(
                     "PARAR máquina para troca imediata. "
-                    "Força mínima abaixo do limite operacional de 800 N. "
+                    "Força mínima abaixo do limite operacional de 800 gf. "
                     "Risco alto de defeito de selagem na embalagem."
                 ),
                 data_disparo=datetime(2026, 5, 12, 6, 0),

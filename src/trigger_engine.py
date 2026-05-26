@@ -152,6 +152,7 @@ class TriggerFeatures:
     eventos_risco_ciclo: int
     eta_ajustado_dias: float
     data_forca_min: str
+    forca_min_ciclo: float
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -713,7 +714,8 @@ class AmarelhoTrigger(TriggerBase):
             acao_recomendada = acao,
             score_atual      = round(features.p_risk, 4),
             slope_forca_7d   = round(features.slope_7d, 1),
-            forca_minima_3d  = round(features.mean_3d, 1) if not np.isnan(features.mean_3d) else None,
+            forca_minima_3d  = round(features.min_3d, 1) if not np.isnan(features.min_3d) else None,
+            proj_48h         = round(features.proj_48h, 1) if not np.isnan(features.proj_48h) else None,
             signal_score     = round(features.sig_score, 4),
         )
 
@@ -791,7 +793,8 @@ class RevisaoTrigger(TriggerBase):
             acao_recomendada = acao,
             score_atual      = round(features.p_risk, 4),
             slope_forca_7d   = round(features.slope_7d, 1),
-            forca_minima_3d  = round(features.mean_3d, 1) if not np.isnan(features.mean_3d) else None,
+            forca_minima_3d  = round(features.min_3d, 1) if not np.isnan(features.min_3d) else None,
+            proj_48h         = round(features.proj_48h, 1) if not np.isnan(features.proj_48h) else None,
             signal_score     = round(features.sig_score, 4),
         )
 
@@ -872,6 +875,8 @@ class TriggerEngine:
         mediana_3d     = _rolling_median(df_hourly, "Media", today, JANELA_MEAN_3D)
         n_abaixo       = _count_below(df_hourly, "Media", today, JANELA_MEAN_3D, RISCO_FORCA_LIMIAR)
         data_forca_min = _date_of_min(df_hourly, "Media", today, JANELA_MEAN_3D)
+        _ciclo_media   = df_hourly.loc[df_hourly.index >= troca_date, "Media"].dropna()
+        forca_min_ciclo = float(_ciclo_media.min()) if len(_ciclo_media) > 0 else float("nan")
         slope          = _slope_7d(df_hourly, media_col, today)
         proj_48h       = _compute_proj_48h(mean_3d, slope)
         sig_score      = _compute_signal_score(mean_3d, mean_14d, slope)
@@ -896,6 +901,7 @@ class TriggerEngine:
             eventos_risco_ciclo   = self.state.get("eventos_risco_ciclo", 0),
             eta_ajustado_dias     = eta_ajustado_dias,
             data_forca_min        = data_forca_min,
+            forca_min_ciclo       = forca_min_ciclo,
         )
 
         fired: List[TriggerEvent] = []
@@ -977,21 +983,34 @@ class TriggerEngine:
                  eta_ajustado_dias: float = 0.0) -> None:
         # Monta o payload sempre — necessário mesmo em dry-run para diagnóstico
         try:
-            if ev.gatilho in ("RISCO", "CRITICO", "EMERGENCIAL"):
+            if ev.gatilho == "RISCO":
+                from .card_formatter import build_risco_card
+                ev.teams_payload = build_risco_card(
+                    maquina            = ev.maquina,
+                    idade_dias         = ev.idade_maintacker,
+                    forca_min          = features.min_3d,
+                    data_forca_min     = features.data_forca_min,
+                    n_abaixo_800_ciclo = ev.evento_no_ciclo,
+                    p_risk             = features.p_risk,
+                    data_disparo       = datetime.fromisoformat(ev.data_disparo[:19]),
+                )
+            elif ev.gatilho in ("CRITICO", "EMERGENCIAL"):
                 ev.teams_payload = _build_card_json(ev, features)
             else:
                 from .card_formatter import build_alert_card
                 ev.teams_payload = build_alert_card(
-                    maquina          = ev.maquina,
-                    gatilho          = ev.gatilho,
-                    idade_dias       = ev.idade_maintacker,
-                    p_risk           = ev.score_atual or 0.0,
-                    slope_7d         = ev.slope_forca_7d,
-                    forca_min_3d     = ev.forca_minima_3d,
-                    proj_48h         = ev.proj_48h,
-                    acao_recomendada = ev.acao_recomendada,
-                    data_disparo     = datetime.fromisoformat(ev.data_disparo[:19]),
-                    vida_ref_dias    = eta_ajustado_dias or self.weibull_eta_d,
+                    maquina              = ev.maquina,
+                    gatilho              = ev.gatilho,
+                    idade_dias           = ev.idade_maintacker,
+                    p_risk               = ev.score_atual or 0.0,
+                    slope_7d             = ev.slope_forca_7d,
+                    forca_min_3d         = ev.forca_minima_3d,
+                    proj_48h             = ev.proj_48h,
+                    acao_recomendada     = ev.acao_recomendada,
+                    data_disparo         = datetime.fromisoformat(ev.data_disparo[:19]),
+                    vida_ref_dias        = eta_ajustado_dias or self.weibull_eta_d,
+                    n_abaixo_800_ciclo   = features.eventos_risco_ciclo,
+                    forca_min_ciclo      = features.forca_min_ciclo,
                 )
         except Exception as exc:
             logger.warning("card build falhou (%s) — TeamsPayload omitido.", exc)
