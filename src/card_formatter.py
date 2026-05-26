@@ -1,10 +1,12 @@
 """
-card_formatter.py — Adaptive Card builder para alertas de selagem no Microsoft Teams.
+card_formatter.py v4.0 — Adaptive Card builder para alertas de selagem no Microsoft Teams.
 
-Recebe os campos de um item da lista Gatilhos_Selagem e retorna JSON string pronto
-para ser gravado na coluna TeamsPayload e postado via Power Automate.
-
-Tradução intencional: jargão técnico → linguagem gerencial.
+Dois tipos de cartão:
+  build_risco_card   — leitura anômala isolada (g/f < 800, sem degradação)
+  build_critico_card — degradação + envelhecimento, com sub_nivel:
+                         AVISO       : aviso precoce
+                         CONFIRMADO  : degradação confirmada
+                         FIM_DE_VIDA : vida útil projetada atingida
 """
 
 import json
@@ -12,22 +14,27 @@ import math
 from datetime import datetime
 from typing import Optional
 
-
-# Dias de operação considerados "vida plena" para escala da barra.
-# Baseado em P50 Weibull (~39.6d) + margem operacional.
 VIDA_REF_DIAS: float = 45.0
 
-_SEVERIDADE_META = {
-    "RED":         {"style": "default",   "titulo": "⚫ FIM DE VIDA DO MAINTACKER",       "bg": "#1a1a1a"},
-    "AMARELO":     {"style": "attention", "titulo": "🔴 ALERTA CRÍTICO",                  "bg": None},
-    "EMERGENCIA":  {"style": "attention", "titulo": "🚨 EMERGÊNCIA",                      "bg": None},
-    "CRITICO":     {"style": "attention", "titulo": "🔴 FORÇA CRÍTICA CONFIRMADA",        "bg": None},
-    "EMERGENCIAL": {"style": "default",   "titulo": "🚨 RISCO IMINENTE DE RETENÇÃO",      "bg": "#1a1a1a"},
-    "REVISAO":     {"style": "accent",    "titulo": "📋 REVISÃO DE CICLO",                "bg": None},
-    "RISCO":       {"style": "warning",   "titulo": "⚠️ RISCO — Leitura Anômala",        "bg": None},
+_CRITICO_META = {
+    "AVISO": {
+        "style": "attention",
+        "titulo": "AVISO — Degradacao Detectada",
+        "bg": None,
+    },
+    "CONFIRMADO": {
+        "style": "attention",
+        "titulo": "ALERTA CRÍTICO",
+        "bg": None,
+    },
+    "FIM_DE_VIDA": {
+        "style": "default",
+        "titulo": "FIM DE VIDA — Troca Imediata",
+        "bg": "#1a1a1a",
+    },
 }
 
-_BAR_WIDTH = 20  # caracteres de largura da barra de vida
+_BAR_WIDTH = 20
 
 
 def _barra_vida(consumida: float) -> str:
@@ -41,12 +48,10 @@ def _label_tendencia(slope_n_por_dia: Optional[float]) -> str:
         return "—"
     val = f"{slope_n_por_dia:+.0f} gf/dia"
     if slope_n_por_dia < -10:
-        return f"▼▼ Declínio acentuado ({val})"
+        return f"Declinio acentuado ({val})"
     if slope_n_por_dia < -3:
-        return f"▼ Declínio leve ({val})"
-    # Slope positivo é ruído AR(1), não recuperação material — o rolo só degrada.
-    # Recuperação real implica troca de rolo (novo ciclo).
-    return f"→ Estável ({val})"
+        return f"Declinio leve ({val})"
+    return f"Estavel ({val})"
 
 
 def _label_risco(p_risk: float) -> str:
@@ -54,391 +59,101 @@ def _label_risco(p_risk: float) -> str:
     if p_risk >= 0.60:
         return f"Alto ({pct}%)"
     if p_risk >= 0.35:
-        return f"Médio ({pct}%)"
+        return f"Medio ({pct}%)"
     return f"Baixo ({pct}%)"
 
 
-def build_ai_prompt(
-    maquina: str,
-    gatilho: str,
-    idade_dias: int,
-    p_risk: float,
-    slope_7d: Optional[float],
-    forca_min_3d: Optional[float],
-    proj_48h: Optional[float],
-    acao_recomendada: str,
-    data_disparo: Optional[datetime] = None,
-    # Contexto histórico — derivado de troca_modulo.csv (30 ciclos FB14)
-    hist_ciclos: int = 30,
-    hist_p50_dias: float = 41.5,
-    hist_media_dias: float = 50.1,
-    hist_p10_dias: float = 11.0,
-    hist_ciclos_recentes: str = "19d, 27d, 49d, 21d, 23d",
-    # Parâmetros Weibull (config.yaml)
-    weibull_beta: float = 1.181,
-    weibull_eta_dias: float = 54.05,
-) -> str:
-    """
-    Monta prompt estruturado para consulta à IA interna da planta.
-
-    Inclui: como o algoritmo funciona, limites reais da FB14, contexto
-    histórico dos ciclos e a situação atual — tudo que a IA precisa para
-    recuperar a documentação certa e dar uma resposta assertiva.
-    """
-    data_str = (data_disparo or datetime.now()).strftime("%d/%m/%Y %H:%M")
-    severidade = {
-        "RED": "ALTA", "AMARELO": "MÉDIA",
-        "EMERGENCIA": "CRÍTICA", "REVISAO": "INFO",
-    }.get(gatilho, "ALTA")
-
-    # Weibull CDF: F(t) = 1 - exp(-(t/η)^β)  — só usa math (stdlib)
-    age_risk = 1.0 - math.exp(-((idade_dias / weibull_eta_dias) ** weibull_beta))
-    age_risk_pct = round(age_risk * 100, 1)
-    p_risk_pct = round(p_risk * 100, 1)
-
-    slope_str = f"{slope_7d:+.1f} gf/dia" if slope_7d is not None else "—"
-    tendencia = _label_tendencia(slope_7d)
-    forca_min_str = f"{round(forca_min_3d)} gf" if forca_min_3d is not None else "—"
-    proj_str = f"{round(proj_48h)} gf" if proj_48h is not None else "—"
-
-    # Significado histórico: em quantos % dos ciclos a troca ocorreu antes desta idade
-    pct_ciclos_mais_curtos = round(
-        sum(1 for d in [19, 27, 49, 21, 23, 23, 21, 26, 17, 185]
-            if d <= idade_dias) / 10 * 100
-    )
-
-    linhas = [
-        f"[SISTEMA DE MANUTENÇÃO PREDITIVA — {maquina} Rolo Maintacker]",
-        f"Gerado em: {data_str} | Gatilho: {gatilho} | Severidade: {severidade}",
-        "",
-        "━━━ COMO O ALGORITMO CALCULA O RISCO ━━━",
-        f"O sistema usa modelo híbrido (Weibull + sinal de força) em duas camadas:",
-        "",
-        f"  1. age_risk = Weibull CDF(idade={idade_dias}d)",
-        f"     β={weibull_beta}, η={weibull_eta_dias:.1f}d",
-        f"     Calibrado em {hist_ciclos} ciclos históricos reais da FB14",
-        f"     → age_risk atual: {age_risk_pct}%",
-        "",
-        f"  2. signal_score = degradação do sinal (ratio média_3d/média_14d + slope)",
-        f"     boost de amplificação: 0.65",
-        "",
-        f"  3. p_risk = age_risk + (1 − age_risk) × signal_score × 0.65",
-        f"     → p_risk atual: {p_risk_pct}%",
-        "",
-        "━━━ LIMITES OPERACIONAIS DA MÁQUINA FB14 ━━━",
-        "  EMERGÊNCIA : força mínima (3d) < 800 gf → intervenção imediata",
-        "  RED        : p_risk ≥ 48% E signal ≥ 22% E projeção 48h < 800 gf (≥2 dias consecutivos)",
-        "  AMARELO    : p_risk ≥ 35% OU signal ≥ 15% (aviso precoce)",
-        "  REVISÃO    : marcos automáticos nos dias 20, 25 e 35 do ciclo",
-        "  Cooldown   : RED 48h | AMARELO 72h | EMERGÊNCIA 48h | Snooze pós-OK: 5 dias",
-        "",
-        f"━━━ CONTEXTO HISTÓRICO ({hist_ciclos} ciclos FB14) ━━━",
-        f"  Duração mediana (P50): {hist_p50_dias}d | Média: {hist_media_dias}d",
-        f"  Ciclos curtos (P10): ~{hist_p10_dias}d | Variação: 1d a 185d",
-        f"  Últimos 5 ciclos   : {hist_ciclos_recentes}",
-        f"  Referência: com {idade_dias} dias de operação, aproximadamente {pct_ciclos_mais_curtos}%",
-        f"  dos ciclos recentes já haviam sido encerrados (troca realizada).",
-        "",
-        "━━━ SITUAÇÃO ATUAL ━━━",
-        f"  Máquina            : {maquina}",
-        f"  Dias em operação   : {idade_dias}d",
-        f"  Gatilho ativo      : {gatilho}",
-        f"  p_risk             : {p_risk_pct}% ({_label_risco(p_risk).split('(')[0].strip()})",
-        f"  Slope força 7d     : {slope_str} ({tendencia})",
-        f"  Força mínima (3d)  : {forca_min_str}  [limite crítico: 800 gf]",
-        f"  Projeção 48h       : {proj_str}",
-        f"  Ação recomendada   : {acao_recomendada}",
-        "",
-        "━━━ PERGUNTA ━━━",
-        f"Com base na documentação técnica do rolo maintacker {maquina} e nos dados acima:",
-        "",
-        f"1. O que um p_risk de {p_risk_pct}% aos {idade_dias} dias de ciclo representa",
-        f"   nos registros históricos desta máquina? Qual foi o desfecho típico?",
-        f"2. Considerando slope de {slope_str} e projeção de {proj_str} em 48h,",
-        f"   quanto tempo temos antes de atingir o limite crítico de 800 gf?",
-        f"3. Como devemos operar nas próximas 48h para evitar parada não planejada?",
-        f"4. Existe algum padrão de degradação documentado que corresponda a este cenário?",
-    ]
-    return "\n".join(linhas)
+def _fmt_gf(v: Optional[float]) -> str:
+    return f"{round(v)} gf" if v is not None and not math.isnan(v) else "—"
 
 
-def build_alert_card(
-    maquina: str,
-    gatilho: str,
-    idade_dias: int,
-    p_risk: float,
-    slope_7d: Optional[float],
-    forca_min_3d: Optional[float],
-    proj_48h: Optional[float],
-    acao_recomendada: str,
-    data_disparo: Optional[datetime] = None,
-    vida_ref_dias: float = VIDA_REF_DIAS,
-    n_abaixo_800_ciclo: int = 0,
-    forca_min_ciclo: Optional[float] = None,
-) -> str:
-    """
-    Retorna JSON string do Adaptive Card pronto para o campo TeamsPayload.
+def _cabecalho(titulo: str, subtitulo: str, maquina: str, data_str: str,
+               style: str, bg: Optional[str]) -> dict:
+    container: dict = {
+        "type": "Container",
+        "style": style,
+        "bleed": True,
+        "items": [{
+            "type": "ColumnSet",
+            "columns": [
+                {"type": "Column", "width": "stretch", "items": [
+                    {"type": "TextBlock", "text": titulo,
+                     "weight": "Bolder", "size": "Large", "color": "Light", "wrap": True},
+                    {"type": "TextBlock", "text": subtitulo,
+                     "color": "Light", "isSubtle": True, "spacing": "None", "wrap": True},
+                ]},
+                {"type": "Column", "width": "auto", "items": [
+                    {"type": "TextBlock", "text": maquina,
+                     "weight": "Bolder", "size": "ExtraLarge", "color": "Light",
+                     "horizontalAlignment": "Right"},
+                    {"type": "TextBlock", "text": data_str,
+                     "color": "Light", "isSubtle": True, "spacing": "None",
+                     "size": "Small", "horizontalAlignment": "Right"},
+                ]},
+            ],
+        }],
+    }
+    if bg:
+        container["backgroundColor"] = bg
+    return container
 
-    Parâmetros vindos da lista Gatilhos_Selagem:
-        maquina         → Title / Maquina
-        gatilho         → RED | AMARELO | EMERGENCIA | REVISAO
-        idade_dias      → IdadeMaintacker
-        p_risk          → ScoreAtual
-        slope_7d        → SlopeForca7d  (gf/dia — negativo = declinando)
-        forca_min_3d    → ForcaMinima3d (N)
-        proj_48h        → proj_48h (N)
-        acao_recomendada→ AcaoRecomendada
-        data_disparo    → DataDisparo
-    """
-    meta = _SEVERIDADE_META.get(gatilho, _SEVERIDADE_META["RED"])
 
-    consumida = min(idade_dias / vida_ref_dias, 1.0)
+def _barra_container(idade_dias: int, vida_ref_dias: float) -> tuple[dict, float]:
+    consumida     = min(idade_dias / vida_ref_dias, 1.0)
     pct_consumida = round(consumida * 100)
     dias_restantes = max(0, round((1.0 - consumida) * vida_ref_dias))
     barra = _barra_vida(consumida)
+    container = {
+        "type": "Container",
+        "style": "emphasis",
+        "spacing": "Medium",
+        "items": [
+            {"type": "TextBlock", "text": "VIDA DO MAINTACKER",
+             "weight": "Bolder", "size": "Small", "isSubtle": True, "spacing": "Small"},
+            {"type": "TextBlock", "text": f"{barra}  **{pct_consumida}% consumida**",
+             "fontType": "Monospace", "spacing": "Small", "wrap": False},
+            {"type": "ColumnSet", "spacing": "Small", "columns": [
+                {"type": "Column", "width": "stretch", "items": [
+                    {"type": "TextBlock", "text": f"{idade_dias} dias em operacao",
+                     "isSubtle": True, "size": "Small"}]},
+                {"type": "Column", "width": "auto", "items": [
+                    {"type": "TextBlock", "text": f"~{dias_restantes} dias para troca",
+                     "isSubtle": True, "size": "Small", "horizontalAlignment": "Right"}]},
+            ]},
+        ],
+    }
+    return container, consumida
 
-    data_str = (data_disparo or datetime.now()).strftime("%d/%m/%Y %H:%M")
 
-    forca_proj_str     = f"{round(proj_48h)} gf"         if proj_48h is not None else "—"
-    forca_min_str      = f"{round(forca_min_3d)} gf"     if forca_min_3d is not None else "—"
-    forca_min_ciclo_str = (
-        f"{round(forca_min_ciclo)} gf"
-        if forca_min_ciclo is not None and not math.isnan(forca_min_ciclo)
-        else "—"
-    )
-    abaixo_str = f"{n_abaixo_800_ciclo}x" if n_abaixo_800_ciclo > 0 else "Nenhuma"
-
-    if gatilho == "REVISAO":
-        indicadores_facts = [
-            {"title": "Força Mínima (3 dias)",  "value": forca_min_str},
-            {"title": "Força Mínima do Ciclo",  "value": forca_min_ciclo_str},
-            {"title": "Força Projetada (48h)",  "value": forca_proj_str},
-            {"title": "< 800 gf no ciclo",       "value": abaixo_str},
-            {"title": "Tendência de Força",     "value": _label_tendencia(slope_7d)},
-        ]
-    elif gatilho in ("AMARELO", "RED"):
-        indicadores_facts = [
-            {"title": "Tendência de Força",     "value": _label_tendencia(slope_7d)},
-            {"title": "Força Projetada (48h)",  "value": forca_proj_str},
-            {"title": "Força Mínima (3 dias)",  "value": forca_min_str},
-            {"title": "Força Mínima do Ciclo",  "value": forca_min_ciclo_str},
-            {"title": "< 800 gf no ciclo",       "value": abaixo_str},
-        ]
-    else:
-        indicadores_facts = [
-            {"title": "Tendência de Força",     "value": _label_tendencia(slope_7d)},
-            {"title": "Força Projetada (48h)",  "value": forca_proj_str},
-            {"title": "Força Mínima (3 dias)",  "value": forca_min_str},
-        ]
-
-    card = {
-        "type": "AdaptiveCard",
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "version": "1.4",
-        "body": [
-            # ── Cabeçalho ─────────────────────────────────────────
-            {
-                "type": "Container",
-                "style": meta["style"],
-                **({"backgroundColor": meta["bg"]} if meta.get("bg") else {}),
-                "bleed": True,
-                "items": [
-                    {
-                        "type": "ColumnSet",
-                        "columns": [
-                            {
-                                "type": "Column",
-                                "width": "stretch",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": meta["titulo"],
-                                        "weight": "Bolder",
-                                        "size": "Large",
-                                        "color": "Light",
-                                        "wrap": True,
-                                    },
-                                    {
-                                        "type": "TextBlock",
-                                        "text": "Força de Selagem — Rolo Maintacker",
-                                        "color": "Light",
-                                        "isSubtle": True,
-                                        "spacing": "None",
-                                        "wrap": True,
-                                    },
-                                ],
-                            },
-                            {
-                                "type": "Column",
-                                "width": "auto",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": maquina,
-                                        "weight": "Bolder",
-                                        "size": "ExtraLarge",
-                                        "color": "Light",
-                                        "horizontalAlignment": "Right",
-                                    },
-                                    {
-                                        "type": "TextBlock",
-                                        "text": data_str,
-                                        "color": "Light",
-                                        "isSubtle": True,
-                                        "horizontalAlignment": "Right",
-                                        "spacing": "None",
-                                        "size": "Small",
-                                    },
-                                ],
-                            },
-                        ],
-                    }
-                ],
-            },
-
-            # ── Barra de vida do maintacker ────────────────────────
-            {
-                "type": "Container",
-                "style": "emphasis",
-                "spacing": "Medium",
-                "items": [
-                    {
-                        "type": "TextBlock",
-                        "text": "VIDA DO MAINTACKER",
-                        "weight": "Bolder",
-                        "size": "Small",
-                        "isSubtle": True,
-                        "spacing": "Small",
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": f"{barra}  **{pct_consumida}% consumida**",
-                        "fontType": "Monospace",
-                        "spacing": "Small",
-                        "wrap": False,
-                    },
-                    {
-                        "type": "ColumnSet",
-                        "spacing": "Small",
-                        "columns": [
-                            {
-                                "type": "Column",
-                                "width": "stretch",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": f"{idade_dias} dias em operação",
-                                        "isSubtle": True,
-                                        "size": "Small",
-                                    }
-                                ],
-                            },
-                            {
-                                "type": "Column",
-                                "width": "auto",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": f"~{dias_restantes} dias para troca",
-                                        "isSubtle": True,
-                                        "size": "Small",
-                                        "horizontalAlignment": "Right",
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                ],
-            },
-
-            # ── Indicadores ────────────────────────────────────────
-            {
-                "type": "Container",
-                "spacing": "Medium",
-                "items": [
-                    {
-                        "type": "TextBlock",
-                        "text": "INDICADORES",
-                        "weight": "Bolder",
-                        "size": "Small",
-                        "isSubtle": True,
-                    },
-                    {
-                        "type": "FactSet",
-                        "facts": indicadores_facts,
-                    },
-                ],
-            },
-
-            # ── Ação recomendada ───────────────────────────────────
-            {
-                "type": "Container",
-                "style": "emphasis",
-                "spacing": "Medium",
-                "items": [
-                    {
-                        "type": "TextBlock",
-                        "text": "AÇÃO RECOMENDADA",
-                        "weight": "Bolder",
-                        "size": "Small",
-                        "isSubtle": True,
-                        "spacing": "Small",
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": acao_recomendada,
-                        "wrap": True,
-                        "weight": "Bolder",
-                        "spacing": "Small",
-                    },
-                ],
-            },
+def _acao_container(acao_recomendada: str) -> dict:
+    return {
+        "type": "Container",
+        "style": "emphasis",
+        "spacing": "Medium",
+        "items": [
+            {"type": "TextBlock", "text": "ACAO RECOMENDADA",
+             "weight": "Bolder", "size": "Small", "isSubtle": True, "spacing": "Small"},
+            {"type": "TextBlock", "text": acao_recomendada,
+             "wrap": True, "weight": "Bolder", "spacing": "Small"},
         ],
     }
 
-    prompt_text = build_ai_prompt(
-        maquina=maquina,
-        gatilho=gatilho,
-        idade_dias=idade_dias,
-        p_risk=p_risk,
-        slope_7d=slope_7d,
-        forca_min_3d=forca_min_3d,
-        proj_48h=proj_48h,
-        acao_recomendada=acao_recomendada,
-        data_disparo=data_disparo,
-    )
 
-    card["actions"] = [
-        {
-            "type": "Action.ShowCard",
-            "title": "💬 Prompt para o Violet",
-            "card": {
-                "type": "AdaptiveCard",
-                "body": [
-                    {
-                        "type": "TextBlock",
-                        "text": "Selecione o texto abaixo, copie e cole na IA interna:",
-                        "size": "Small",
-                        "isSubtle": True,
-                        "wrap": True,
-                        "spacing": "Small",
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": prompt_text,
-                        "fontType": "Monospace",
-                        "size": "Small",
-                        "wrap": True,
-                        "spacing": "Small",
-                    },
-                ],
-            },
-        }
-    ]
-
-    return json.dumps(card, ensure_ascii=False, indent=2)
+def _indicadores_container(facts: list) -> dict:
+    return {
+        "type": "Container",
+        "spacing": "Medium",
+        "items": [
+            {"type": "TextBlock", "text": "INDICADORES",
+             "weight": "Bolder", "size": "Small", "isSubtle": True},
+            {"type": "FactSet", "facts": facts},
+        ],
+    }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RISCO — leitura anômala isolada
+# ─────────────────────────────────────────────────────────────────────────────
 def build_risco_card(
     maquina: str,
     idade_dias: int,
@@ -449,19 +164,10 @@ def build_risco_card(
     data_disparo: Optional[datetime] = None,
     media_3d: Optional[float] = None,
     acao_recomendada: str = (
-        "Ir ao local e verificar os motivos da força de selagem abaixo de 800 gf. "
-        "Rolo novo — sem degradação associada."
+        "Ir ao local e verificar os motivos da forca de selagem abaixo de 800 gf. "
+        "Rolo sem degradacao associada."
     ),
 ) -> str:
-    """
-    Adaptive Card para gatilho RISCO: leitura isolada abaixo de 800 gf em rolo sem degradação.
-
-    Parâmetros:
-        forca_min          → features.min_3d (N)
-        data_forca_min     → features.data_forca_min ("YYYY-MM-DD")
-        n_abaixo_800_ciclo → ev.evento_no_ciclo (Nº acumulado no ciclo)
-        p_risk             → features.p_risk (baixo — sem degradação)
-    """
     data_str = (data_disparo or datetime.now()).strftime("%d/%m/%Y %H:%M")
 
     try:
@@ -469,166 +175,60 @@ def build_risco_card(
     except Exception:
         data_evento_fmt = data_forca_min
 
-    forca_str    = f"{round(forca_min)} gf"  if not math.isnan(forca_min) else "—"
-    media_3d_str = f"{round(media_3d)} gf"  if media_3d is not None and not math.isnan(media_3d) else "—"
+    forca_str    = f"{round(forca_min)} gf" if not math.isnan(forca_min) else "—"
+    media_3d_str = _fmt_gf(media_3d)
 
     card = {
         "type": "AdaptiveCard",
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "version": "1.4",
         "body": [
-            # ── Cabeçalho ─────────────────────────────────────────
-            {
-                "type": "Container",
-                "style": "warning",
-                "bleed": True,
-                "items": [
-                    {
-                        "type": "ColumnSet",
-                        "columns": [
-                            {
-                                "type": "Column",
-                                "width": "stretch",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": "⚠️ RISCO — Leitura Anômala",
-                                        "weight": "Bolder",
-                                        "size": "Large",
-                                        "color": "Light",
-                                        "wrap": True,
-                                    },
-                                    {
-                                        "type": "TextBlock",
-                                        "text": "Força de Selagem — Rolo Maintacker",
-                                        "color": "Light",
-                                        "isSubtle": True,
-                                        "spacing": "None",
-                                        "wrap": True,
-                                    },
-                                ],
-                            },
-                            {
-                                "type": "Column",
-                                "width": "auto",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": maquina,
-                                        "weight": "Bolder",
-                                        "size": "ExtraLarge",
-                                        "color": "Light",
-                                        "horizontalAlignment": "Right",
-                                    },
-                                    {
-                                        "type": "TextBlock",
-                                        "text": data_str,
-                                        "color": "Light",
-                                        "isSubtle": True,
-                                        "horizontalAlignment": "Right",
-                                        "spacing": "None",
-                                        "size": "Small",
-                                    },
-                                ],
-                            },
-                        ],
-                    }
-                ],
-            },
-
-            # ── Evento ────────────────────────────────────────────
+            _cabecalho(
+                titulo    = "RISCO — Leitura Anomala",
+                subtitulo = "Forca de Selagem — Rolo Maintacker",
+                maquina   = maquina,
+                data_str  = data_str,
+                style     = "warning",
+                bg        = None,
+            ),
             {
                 "type": "Container",
                 "style": "emphasis",
                 "spacing": "Medium",
                 "items": [
-                    {
-                        "type": "TextBlock",
-                        "text": "EVENTO",
-                        "weight": "Bolder",
-                        "size": "Small",
-                        "isSubtle": True,
-                        "spacing": "Small",
-                    },
-                    {
-                        "type": "FactSet",
-                        "facts": [
-                            {
-                                "title": "Força mínima registrada",
-                                "value": forca_str,
-                            },
-                            {
-                                "title": "Força média (3 dias)",
-                                "value": media_3d_str,
-                            },
-                            {
-                                "title": "Data do evento",
-                                "value": data_evento_fmt,
-                            },
-                            {
-                                "title": "< 800 gf no ciclo",
-                                "value": f"{n_abaixo_800_ciclo}x",
-                            },
-                        ],
-                    },
+                    {"type": "TextBlock", "text": "EVENTO",
+                     "weight": "Bolder", "size": "Small", "isSubtle": True, "spacing": "Small"},
+                    {"type": "FactSet", "facts": [
+                        {"title": "Forca minima registrada", "value": forca_str},
+                        {"title": "Forca media (3 dias)",    "value": media_3d_str},
+                        {"title": "Data do evento",          "value": data_evento_fmt},
+                        {"title": "< 800 gf no ciclo",       "value": f"{n_abaixo_800_ciclo}x"},
+                    ]},
                 ],
             },
-
-            # ── Status do rolo ────────────────────────────────────
             {
                 "type": "Container",
                 "spacing": "Medium",
                 "items": [
-                    {
-                        "type": "TextBlock",
-                        "text": "STATUS DO ROLO",
-                        "weight": "Bolder",
-                        "size": "Small",
-                        "isSubtle": True,
-                    },
-                    {
-                        "type": "FactSet",
-                        "facts": [
-                            {
-                                "title": "Dias em operação",
-                                "value": f"{idade_dias} dias",
-                            },
-                        ],
-                    },
+                    {"type": "TextBlock", "text": "STATUS DO ROLO",
+                     "weight": "Bolder", "size": "Small", "isSubtle": True},
+                    {"type": "FactSet", "facts": [
+                        {"title": "Dias em operacao", "value": f"{idade_dias} dias"},
+                    ]},
                 ],
             },
-
-            # ── Ação recomendada ───────────────────────────────────
-            {
-                "type": "Container",
-                "style": "emphasis",
-                "spacing": "Medium",
-                "items": [
-                    {
-                        "type": "TextBlock",
-                        "text": "AÇÃO RECOMENDADA",
-                        "weight": "Bolder",
-                        "size": "Small",
-                        "isSubtle": True,
-                        "spacing": "Small",
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": acao_recomendada,
-                        "wrap": True,
-                        "weight": "Bolder",
-                        "spacing": "Small",
-                    },
-                ],
-            },
+            _acao_container(acao_recomendada),
         ],
     }
-
     return json.dumps(card, ensure_ascii=False, indent=2)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CRITICO — degradação + envelhecimento (AVISO / CONFIRMADO / FIM_DE_VIDA)
+# ─────────────────────────────────────────────────────────────────────────────
 def build_critico_card(
     maquina: str,
+    sub_nivel: str,
     idade_dias: int,
     p_risk: float,
     slope_7d: Optional[float],
@@ -640,199 +240,62 @@ def build_critico_card(
     data_disparo: Optional[datetime] = None,
     vida_ref_dias: float = VIDA_REF_DIAS,
     eventos_risco_ciclo: int = 0,
+    forca_min_ciclo: Optional[float] = None,
 ) -> str:
-    """Adaptive Card para CRITICO: força crítica confirmada com p_risk elevado."""
-    meta = _SEVERIDADE_META["CRITICO"]
-    consumida     = min(idade_dias / vida_ref_dias, 1.0)
-    pct_consumida = round(consumida * 100)
-    dias_restantes = max(0, round((1.0 - consumida) * vida_ref_dias))
-    barra     = _barra_vida(consumida)
-    data_str  = (data_disparo or datetime.now()).strftime("%d/%m/%Y %H:%M")
+    meta     = _CRITICO_META.get(sub_nivel, _CRITICO_META["CONFIRMADO"])
+    data_str = (data_disparo or datetime.now()).strftime("%d/%m/%Y %H:%M")
 
-    def _fmt(v: Optional[float]) -> str:
-        return f"{round(v)} gf" if v is not None and not math.isnan(v) else "—"
+    barra_container, consumida = _barra_container(idade_dias, vida_ref_dias)
 
-    indicadores = [
-        {"title": "Tendência de Força",      "value": _label_tendencia(slope_7d)},
-        {"title": "Força Mínima (3 dias)",   "value": _fmt(forca_min_3d)},
-        {"title": "Força Projetada (48h)",   "value": _fmt(proj_48h)},
-        {"title": "Média 7d atual",          "value": _fmt(media_7d)},
-        {"title": "Média 7d anterior",       "value": _fmt(media_7d_anterior)},
-        {"title": "Risco acumulado",         "value": _label_risco(p_risk)},
-        {"title": "Eventos críticos ciclo",  "value": f"{eventos_risco_ciclo}x"},
-    ]
+    # Para FIM_DE_VIDA: mostrar quanto passou do ETA quando consumida > 1
+    if consumida >= 1.0 and sub_nivel == "FIM_DE_VIDA":
+        dias_alem = idade_dias - round(vida_ref_dias)
+        barra_container["items"][2]["columns"][1]["items"][0]["text"] = (
+            f"{dias_alem} dias alem do ETA"
+        )
+
+    if sub_nivel == "FIM_DE_VIDA":
+        indicadores_facts = [
+            {"title": "Forca Minima (3 dias)",  "value": _fmt_gf(forca_min_3d)},
+            {"title": "Forca Projetada (48h)",  "value": _fmt_gf(proj_48h)},
+            {"title": "Media 7d atual",         "value": _fmt_gf(media_7d)},
+            {"title": "Tendencia de Forca",     "value": _label_tendencia(slope_7d)},
+            {"title": "Risco acumulado",        "value": _label_risco(p_risk)},
+        ]
+    elif sub_nivel == "CONFIRMADO":
+        indicadores_facts = [
+            {"title": "Tendência de Força",          "value": _label_tendencia(slope_7d)},
+            {"title": "Força Projetada (48h)",        "value": _fmt_gf(proj_48h)},
+            {"title": "Força Mínima (3 dias)",        "value": _fmt_gf(forca_min_3d)},
+            {"title": "Força Mínima do Ciclo",        "value": _fmt_gf(forca_min_ciclo)},
+            {"title": "< 800 gf no ciclo atual",      "value": f"{eventos_risco_ciclo}x"},
+            {"title": "Média da Semana Atual",        "value": _fmt_gf(media_7d)},
+            {"title": "Média da Semana Retrasada",    "value": _fmt_gf(media_7d_anterior)},
+        ]
+    else:  # AVISO
+        indicadores_facts = [
+            {"title": "Tendencia de Forca",    "value": _label_tendencia(slope_7d)},
+            {"title": "Forca Projetada (48h)", "value": _fmt_gf(proj_48h)},
+            {"title": "Media 7d atual",        "value": _fmt_gf(media_7d)},
+            {"title": "Risco acumulado",       "value": _label_risco(p_risk)},
+        ]
 
     card = {
         "type": "AdaptiveCard",
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "version": "1.4",
         "body": [
-            {
-                "type": "Container",
-                "style": meta["style"],
-                "bleed": True,
-                "items": [{
-                    "type": "ColumnSet",
-                    "columns": [
-                        {"type": "Column", "width": "stretch", "items": [
-                            {"type": "TextBlock", "text": meta["titulo"],
-                             "weight": "Bolder", "size": "Large", "color": "Light", "wrap": True},
-                            {"type": "TextBlock", "text": "Força de Selagem — Rolo Maintacker",
-                             "color": "Light", "isSubtle": True, "spacing": "None", "wrap": True},
-                        ]},
-                        {"type": "Column", "width": "auto", "items": [
-                            {"type": "TextBlock", "text": maquina,
-                             "weight": "Bolder", "size": "ExtraLarge", "color": "Light",
-                             "horizontalAlignment": "Right"},
-                            {"type": "TextBlock", "text": data_str,
-                             "color": "Light", "isSubtle": True, "spacing": "None",
-                             "size": "Small", "horizontalAlignment": "Right"},
-                        ]},
-                    ],
-                }],
-            },
-            {
-                "type": "Container", "style": "emphasis", "spacing": "Medium",
-                "items": [
-                    {"type": "TextBlock", "text": "VIDA DO MAINTACKER",
-                     "weight": "Bolder", "size": "Small", "isSubtle": True, "spacing": "Small"},
-                    {"type": "TextBlock", "text": f"{barra}  **{pct_consumida}% consumida**",
-                     "fontType": "Monospace", "spacing": "Small", "wrap": False},
-                    {"type": "ColumnSet", "spacing": "Small", "columns": [
-                        {"type": "Column", "width": "stretch", "items": [
-                            {"type": "TextBlock", "text": f"{idade_dias} dias em operação",
-                             "isSubtle": True, "size": "Small"}]},
-                        {"type": "Column", "width": "auto", "items": [
-                            {"type": "TextBlock", "text": f"~{dias_restantes} dias para troca",
-                             "isSubtle": True, "size": "Small", "horizontalAlignment": "Right"}]},
-                    ]},
-                ],
-            },
-            {
-                "type": "Container", "spacing": "Medium",
-                "items": [
-                    {"type": "TextBlock", "text": "INDICADORES",
-                     "weight": "Bolder", "size": "Small", "isSubtle": True},
-                    {"type": "FactSet", "facts": indicadores},
-                ],
-            },
-            {
-                "type": "Container", "style": "emphasis", "spacing": "Medium",
-                "items": [
-                    {"type": "TextBlock", "text": "AÇÃO RECOMENDADA",
-                     "weight": "Bolder", "size": "Small", "isSubtle": True, "spacing": "Small"},
-                    {"type": "TextBlock", "text": acao_recomendada,
-                     "wrap": True, "weight": "Bolder", "spacing": "Small"},
-                ],
-            },
-        ],
-    }
-    return json.dumps(card, ensure_ascii=False, indent=2)
-
-
-def build_emergencial_card(
-    maquina: str,
-    idade_dias: int,
-    p_risk: float,
-    slope_7d: Optional[float],
-    forca_min_3d: Optional[float],
-    proj_48h: Optional[float],
-    media_7d: Optional[float],
-    acao_recomendada: str,
-    data_disparo: Optional[datetime] = None,
-    vida_ref_dias: float = VIDA_REF_DIAS,
-    eventos_risco_ciclo: int = 0,
-) -> str:
-    """Adaptive Card para EMERGENCIAL: risco iminente de retenção, urgência máxima."""
-    meta = _SEVERIDADE_META["EMERGENCIAL"]
-    consumida     = min(idade_dias / vida_ref_dias, 1.0)
-    pct_consumida = round(consumida * 100)
-    dias_restantes = round((1.0 - consumida) * vida_ref_dias)
-    barra     = _barra_vida(consumida)
-    data_str  = (data_disparo or datetime.now()).strftime("%d/%m/%Y %H:%M")
-
-    def _fmt(v: Optional[float]) -> str:
-        return f"{round(v)} gf" if v is not None and not math.isnan(v) else "—"
-
-    vida_label = (
-        f"⚠️ {abs(dias_restantes)} dias além da vida de referência"
-        if dias_restantes < 0
-        else f"~{dias_restantes} dias para troca"
-    )
-
-    indicadores = [
-        {"title": "Força Mínima (3 dias)",   "value": _fmt(forca_min_3d)},
-        {"title": "Força Projetada (48h)",   "value": _fmt(proj_48h)},
-        {"title": "Média 7d atual",          "value": _fmt(media_7d)},
-        {"title": "Tendência de Força",      "value": _label_tendencia(slope_7d)},
-        {"title": "Risco acumulado",         "value": _label_risco(p_risk)},
-        {"title": "Eventos críticos ciclo",  "value": f"{eventos_risco_ciclo}x"},
-    ]
-
-    card = {
-        "type": "AdaptiveCard",
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "version": "1.4",
-        "body": [
-            {
-                "type": "Container",
-                "style": meta["style"],
-                "backgroundColor": meta["bg"],
-                "bleed": True,
-                "items": [{
-                    "type": "ColumnSet",
-                    "columns": [
-                        {"type": "Column", "width": "stretch", "items": [
-                            {"type": "TextBlock", "text": meta["titulo"],
-                             "weight": "Bolder", "size": "Large", "color": "Light", "wrap": True},
-                            {"type": "TextBlock", "text": "Força de Selagem — Rolo Maintacker",
-                             "color": "Light", "isSubtle": True, "spacing": "None", "wrap": True},
-                        ]},
-                        {"type": "Column", "width": "auto", "items": [
-                            {"type": "TextBlock", "text": maquina,
-                             "weight": "Bolder", "size": "ExtraLarge", "color": "Light",
-                             "horizontalAlignment": "Right"},
-                            {"type": "TextBlock", "text": data_str,
-                             "color": "Light", "isSubtle": True, "spacing": "None",
-                             "size": "Small", "horizontalAlignment": "Right"},
-                        ]},
-                    ],
-                }],
-            },
-            {
-                "type": "Container", "style": "emphasis", "spacing": "Medium",
-                "items": [
-                    {"type": "TextBlock", "text": "VIDA DO MAINTACKER",
-                     "weight": "Bolder", "size": "Small", "isSubtle": True, "spacing": "Small"},
-                    {"type": "TextBlock", "text": f"{barra}  **{pct_consumida}% consumida**",
-                     "fontType": "Monospace", "spacing": "Small", "wrap": False},
-                    {"type": "ColumnSet", "spacing": "Small", "columns": [
-                        {"type": "Column", "width": "stretch", "items": [
-                            {"type": "TextBlock", "text": f"{idade_dias} dias em operação",
-                             "isSubtle": True, "size": "Small"}]},
-                        {"type": "Column", "width": "auto", "items": [
-                            {"type": "TextBlock", "text": vida_label,
-                             "isSubtle": True, "size": "Small", "horizontalAlignment": "Right"}]},
-                    ]},
-                ],
-            },
-            {
-                "type": "Container", "spacing": "Medium",
-                "items": [
-                    {"type": "TextBlock", "text": "INDICADORES",
-                     "weight": "Bolder", "size": "Small", "isSubtle": True},
-                    {"type": "FactSet", "facts": indicadores},
-                ],
-            },
-            {
-                "type": "Container", "style": "emphasis", "spacing": "Medium",
-                "items": [
-                    {"type": "TextBlock", "text": "AÇÃO RECOMENDADA",
-                     "weight": "Bolder", "size": "Small", "isSubtle": True, "spacing": "Small"},
-                    {"type": "TextBlock", "text": acao_recomendada,
-                     "wrap": True, "weight": "Bolder", "spacing": "Small"},
-                ],
-            },
+            _cabecalho(
+                titulo    = meta["titulo"],
+                subtitulo = "Forca de Selagem — Rolo Maintacker",
+                maquina   = maquina,
+                data_str  = data_str,
+                style     = meta["style"],
+                bg        = meta["bg"],
+            ),
+            barra_container,
+            _indicadores_container(indicadores_facts),
+            _acao_container(acao_recomendada),
         ],
     }
     return json.dumps(card, ensure_ascii=False, indent=2)
@@ -841,64 +304,23 @@ def build_emergencial_card(
 # ── Teste com dados sintéticos ─────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    scenarios = [
-        {
-            "label": "RED — FB14 (27 dias, declínio acentuado)",
-            "args": dict(
-                maquina="FB14",
-                gatilho="RED",
-                idade_dias=27,
-                p_risk=0.63,
-                slope_7d=-8.2,
-                forca_min_3d=812.0,
-                proj_48h=870.0,
-                acao_recomendada=(
-                    "Programar troca preventiva do rolo maintacker esta semana. "
-                    "Força abaixo de 800 gf pode causar falhas de selagem com impacto "
-                    "direto na qualidade do produto."
-                ),
-                data_disparo=datetime(2026, 5, 12, 14, 35),
-            ),
-        },
-        {
-            "label": "AMARELO — FB14 (18 dias, declínio leve)",
-            "args": dict(
-                maquina="FB14",
-                gatilho="AMARELO",
-                idade_dias=18,
-                p_risk=0.38,
-                slope_7d=-4.1,
-                forca_min_3d=940.0,
-                proj_48h=920.0,
-                acao_recomendada=(
-                    "Monitorar força de selagem diariamente. "
-                    "Incluir troca do maintacker no próximo plano de manutenção preventiva."
-                ),
-                data_disparo=datetime(2026, 5, 12, 9, 10),
-            ),
-        },
-        {
-            "label": "EMERGENCIA — FB14 (38 dias, força crítica)",
-            "args": dict(
-                maquina="FB14",
-                gatilho="EMERGENCIA",
-                idade_dias=38,
-                p_risk=0.88,
-                slope_7d=-14.5,
-                forca_min_3d=791.0,
-                proj_48h=765.0,
-                acao_recomendada=(
-                    "PARAR máquina para troca imediata. "
-                    "Força mínima abaixo do limite operacional de 800 gf. "
-                    "Risco alto de defeito de selagem na embalagem."
-                ),
-                data_disparo=datetime(2026, 5, 12, 6, 0),
-            ),
-        },
-    ]
+    from datetime import datetime
 
-    for s in scenarios:
-        print(f"\n{'='*60}")
-        print(f"  {s['label']}")
-        print('='*60)
-        print(build_alert_card(**s["args"]))
+    print("=== RISCO ===")
+    print(build_risco_card(
+        maquina="FB14", idade_dias=8, forca_min=762.0,
+        data_forca_min="2026-05-24", n_abaixo_800_ciclo=1,
+        p_risk=0.12, media_3d=980.0,
+        data_disparo=datetime(2026, 5, 26, 8, 0),
+    )[:200], "...")
+
+    for sub in ("AVISO", "CONFIRMADO", "FIM_DE_VIDA"):
+        print(f"\n=== CRITICO / {sub} ===")
+        print(build_critico_card(
+            maquina="FB14", sub_nivel=sub, idade_dias=38,
+            p_risk=0.72, slope_7d=-9.1, forca_min_3d=790.0,
+            proj_48h=755.0, media_7d=820.0, media_7d_anterior=870.0,
+            acao_recomendada="Troca do rolo maintacker urgente.",
+            data_disparo=datetime(2026, 5, 26, 8, 0),
+            vida_ref_dias=45.0, eventos_risco_ciclo=3,
+        )[:200], "...")

@@ -1,29 +1,19 @@
 """
-trigger_engine.py v3.0 — Motor de Gatilho Probabilístico Multi-Nível
-Referência: SDD_Manutencao_Preditiva_v1.docx / Issue #1
+trigger_engine.py v4.0 — Motor de Gatilho Probabilístico Simplificado
+Referência: SDD_Manutencao_Preditiva_v1.docx
 
-Mudanças v2.3 → v3.0
-  - Nova hierarquia aprovada com o time:
-      RISCO      (ex-OUTLIER_SINAL) — leitura isolada, ir verificar no local
-      CRITICO    (ex-EMERGENCIA)    — força crítica + p_risk ≥ 0.40
-      EMERGENCIAL (novo, cumulativo) — ≥3 eventos + idade ≥ 85% eta_ajustado
-                                       + p_risk ≥ 0.40 + MM7d declinante
+Mudanças v3.0 → v4.0
+  - Hierarquia simplificada para dois cartões apresentáveis:
+      RISCO    — leitura anômala isolada (g/f < 800, sem degradação/envelhecimento)
+      CRITICO  — degradação + envelhecimento, com severidade graduada internamente:
+                   AVISO       : aviso precoce (ex-AMARELO)
+                   CONFIRMADO  : degradação confirmada (ex-RED + ex-CRITICO)
+                   FIM_DE_VIDA : age >= eta_ajustado - 5 dias (absorve REVISAO/EMERGENCIAL)
 
-  - Sistema de pontuação de desconfiança: `eventos_risco_ciclo` conta eventos
-    força < 800 N no ciclo; reseta na troca; exibido nos cards como
-    "Evento Nº{N} no ciclo atual".
-
-  - Novo contrato JSON para TeamsPayload: schemas estruturados por nível
-    (RISCO / CRITICO / EMERGENCIAL). RED / AMARELO / REVISAO continuam
-    usando card_formatter.
-
-  - TriggerFeatures expandido: mean_7d, mean_7d_3d_ago, eventos_risco_ciclo,
-    eta_ajustado_dias, data_forca_min.
-
-  - Migração de estado automática v2.3 → v3.0 em _load_state().
-
-  - API pública inalterada: evaluate(), close_all_by_troca(), snooze(),
-    compute_p_risk_snapshot().
+  - Removidos: EmergencialTrigger, RedTrigger, AmarelhoTrigger, RevisaoTrigger
+  - TriggerEvent ganha campo sub_nivel (None para RISCO, AVISO/CONFIRMADO/FIM_DE_VIDA para CRITICO)
+  - Migração automática de estado v3.0 → v4.0 em _load_state()
+  - API pública inalterada: evaluate(), close_all_by_troca(), snooze(), compute_p_risk_snapshot()
 """
 
 from __future__ import annotations
@@ -31,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -42,45 +32,41 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constantes módulo — valores padrão / fallback
+# Constantes
 # ─────────────────────────────────────────────────────────────────────────────
 
 WEIBULL_BETA    = 1.181
 WEIBULL_ETA_H   = 1297.0
 WEIBULL_ETA_D   = WEIBULL_ETA_H / 24.0
 
+BOOST_SINAL           = 0.65
 LIMIAR_P_RISK         = 0.48
 LIMIAR_SIGNAL_SCORE   = 0.22
 IDADE_MINIMA_DIAS     = 15
 PROJ_48H_LIMIAR       = 800.0
 SUSTENTACAO_PROJ_DIAS = 2
-BOOST_SINAL           = 0.65
+COOLDOWN_H            = 48
+SNOOZE_DIAS           = 5
 
-COOLDOWN_H  = 48
-SNOOZE_DIAS = 5
+# AVISO (ex-AMARELO)
+AVISO_P_RISK     = 0.35
+AVISO_SIGNAL     = 0.15
+AVISO_COOLDOWN_H = 72
 
-AMARELO_P_RISK     = 0.35
-AMARELO_SIGNAL     = 0.15
-AMARELO_COOLDOWN_H = 72
-
-# RISCO (ex-OUTLIER_SINAL)
+# RISCO
 RISCO_FORCA_LIMIAR = 800.0
 RISCO_MEDIANA_OK   = 950.0
 RISCO_N_MAX        = 1
 RISCO_COOLDOWN_H   = 48
 
-# CRITICO (ex-EMERGENCIA)
+# CONFIRMADO (força crítica, ex-CRITICO)
 CRITICO_FORCA_MIN  = 800.0
 CRITICO_P_RISK_MIN = 0.40
 CRITICO_COOLDOWN_H = 48
 
-# EMERGENCIAL — cumulativo, novo em v3.0
-EMERGENCIAL_MIN_EVENTOS = 3
-EMERGENCIAL_IDADE_FRAC  = 0.85
-EMERGENCIAL_P_RISK_MIN  = 0.40
-EMERGENCIAL_COOLDOWN_H  = 48
-
-REVISAO_MARCOS_DIAS = [20, 25, 35]
+# FIM_DE_VIDA — dispara quando restar este número de dias até o ETA ajustado
+FIM_DE_VIDA_DIAS_ANTES = 5
+FIM_DE_VIDA_COOLDOWN_H = 48
 
 JANELA_SLOPE_D  = 7
 JANELA_MEAN_3D  = 3
@@ -108,6 +94,7 @@ class TriggerEvent:
     idade_maintacker: int
     data_disparo: str
     acao_recomendada: str
+    sub_nivel: Optional[str] = None       # AVISO | CONFIRMADO | FIM_DE_VIDA (só CRITICO)
     evento_no_ciclo: int = 0
     score_atual: Optional[float] = None
     slope_forca_7d: Optional[float] = None
@@ -131,7 +118,7 @@ class TriggerEvent:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Snapshot de métricas — v3.0
+# Snapshot de métricas
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class TriggerFeatures:
@@ -163,17 +150,15 @@ def _default_state(maquina: str) -> dict:
     return {
         "maquina": maquina,
         "eventos_risco_ciclo": 0,
-        "red": {
-            "red_sp_id":    None,
-            "last_fired":   None,
-            "snooze_until": None,
-            "proj_window":  [],
+        "risco":  {"sp_id": None, "last_fired": None},
+        "critico": {
+            "sp_id":                  None,
+            "last_fired_aviso":       None,
+            "last_fired_confirmado":  None,
+            "last_fired_fim_de_vida": None,
+            "snooze_until":           None,
+            "proj_window":            [],
         },
-        "amarelo":    {"sp_id": None, "last_fired": None},
-        "critico":    {"sp_id": None, "last_fired": None},
-        "emergencial":{"sp_id": None, "last_fired": None},
-        "risco":      {"sp_id": None, "last_fired": None},
-        "revisao":    {"marcos_disparados": []},
     }
 
 
@@ -191,16 +176,25 @@ def _load_state(path: Path, maquina: str) -> dict:
     if path.exists():
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        if "red" not in data:
-            logger.info("Estado v1 em '%s' — migrando para v3.0.", path)
+        # Migração v1 → v4.0
+        if "red" not in data and "critico" not in data:
+            logger.info("Estado v1 em '%s' — resetando para v4.0.", path)
             return defaults
         # Migração v2.3 → v3.0
         if "outlier_sinal" in data and "risco" not in data:
             data["risco"] = data.pop("outlier_sinal")
-            logger.info("Migração v2.3→v3.0: outlier_sinal → risco")
         if "emergencia" in data and "critico" not in data:
             data["critico"] = data.pop("emergencia")
-            logger.info("Migração v2.3→v3.0: emergencia → critico")
+        # Migração v3.0 → v4.0: colapsa amarelo/red/emergencial/revisao em critico
+        old_keys = {"amarelo", "red", "emergencial", "revisao"}
+        if old_keys & set(data.keys()):
+            logger.info("Migrando estado v3.0 -> v4.0: consolidando em critico.")
+            for k in old_keys:
+                data.pop(k, None)
+            data["critico"] = defaults["critico"]
+        # Migração critico v3.0 (sem last_fired_aviso) → v4.0
+        if "critico" in data and "last_fired_aviso" not in data.get("critico", {}):
+            data["critico"] = defaults["critico"]
         _merge_defaults(data, defaults)
         return data
     return defaults
@@ -249,7 +243,7 @@ def _align_tz(ts: pd.Timestamp, index: pd.DatetimeIndex) -> pd.Timestamp:
     return ts.tz_localize(index.tz) if ts.tzinfo is None else ts.tz_convert(index.tz)
 
 
-_DAY_END = pd.Timedelta(hours=23, minutes=59)   # inclui intradiário do dia atual
+_DAY_END = pd.Timedelta(hours=23, minutes=59)
 
 
 def _rolling_mean(df: pd.DataFrame, col: str, ref: pd.Timestamp, days: int) -> float:
@@ -306,15 +300,7 @@ def _weibull_age_risk(age_days: float, beta: float = WEIBULL_BETA,
 
 def _min_slope_ciclo(df: pd.DataFrame, col: str,
                      cycle_start: pd.Timestamp, today: pd.Timestamp) -> float:
-    """Worst (most negative) 7d slope observed since cycle_start.
-
-    Physical justification: the roll degrades monotonically — force recovery
-    is transient noise, not material recovery. The minimum slope is the best
-    estimate of the true underlying degradation rate.
-
-    Only considers windows fully within the cycle (starts at cycle_start + 7d).
-    Falls back to the current slope when the cycle is younger than 7 days.
-    """
+    """Pior slope (mais negativo) de 7 dias observado desde cycle_start."""
     first_valid = cycle_start + pd.Timedelta(days=JANELA_SLOPE_D)
     if first_valid > today:
         return _slope_7d(df, col, today)
@@ -349,12 +335,13 @@ def _in_cooldown(last_fired_iso: Optional[str], cooldown_h: float,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Card JSON estruturado — contrato v3.0 com Power Automate
+# Card JSON estruturado — contrato v4.0 com Power Automate
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_card_json(ev: TriggerEvent, features: TriggerFeatures) -> str:
     dias_restantes = int(round(features.eta_ajustado_dias - features.age_days))
     base: dict = {
         "nivel":             ev.gatilho,
+        "sub_nivel":         ev.sub_nivel,
         "evento_no_ciclo":   ev.evento_no_ciclo,
         "dias_operacao":     int(features.age_days),
         "eta_ajustado_dias": int(round(features.eta_ajustado_dias)),
@@ -377,18 +364,8 @@ def _build_card_json(ev: TriggerEvent, features: TriggerFeatures) -> str:
             base["media_movel_7d_anterior_gf"] = int(round(features.mean_7d_3d_ago))
         if not np.isnan(features.mean_7d):
             base["media_movel_7d_atual_gf"] = int(round(features.mean_7d))
-        base["eventos_risco_ciclo"] = ev.evento_no_ciclo
-
-    elif ev.gatilho == "EMERGENCIAL":
-        if not np.isnan(features.min_3d):
-            base["forca_min_ultima_amostra_gf"] = int(round(features.min_3d))
-        base["data_forca_min"] = features.data_forca_min
-        if not np.isnan(features.proj_48h):
-            base["forca_projetada_48h_gf"] = int(round(features.proj_48h))
-        if not np.isnan(features.mean_7d):
-            base["media_movel_7d_atual_gf"] = int(round(features.mean_7d))
         base["p_risk"] = round(features.p_risk, 2)
-        base["eventos_risco_ciclo"] = features.eventos_risco_ciclo
+        base["eventos_risco_ciclo"] = ev.evento_no_ciclo
 
     return json.dumps(base, ensure_ascii=False)
 
@@ -424,7 +401,7 @@ class TriggerBase(ABC):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RiscoTrigger(TriggerBase):
-    """Leitura anômala isolada — força < 800 N, isolada, sinal geral saudável."""
+    """Leitura anômala isolada — g/f < 800 N, isolada, sinal geral saudável."""
     name      = "RISCO"
     severity  = "INFO"
     state_key = "risco"
@@ -452,17 +429,17 @@ class RiscoTrigger(TriggerBase):
         evento_n = state.get("eventos_risco_ciclo", 0) + 1
         min_str  = f"{features.min_3d:.0f}" if not np.isnan(features.min_3d) else "N/D"
         acao = (
-            f"Ir verificar no local — analisar última amostra ({min_str} N) e identificar causa. "
-            f"Se 2+ leituras abaixo de {self.forca_limiar:.0f} N nas próximas 72h, "
-            "o sistema escalará para CRÍTICO."
+            f"Ir verificar no local — analisar ultima amostra ({min_str} N) e identificar causa. "
+            f"Se 2+ leituras abaixo de {self.forca_limiar:.0f} N nas proximas 72h, "
+            "o sistema escalara para CRITICO."
         )
         return TriggerEvent(
             maquina          = maquina,
             gatilho          = self.name,
             severidade       = self.severity,
             mensagem         = (
-                f"RISCO FB14 — Leitura Anômala Isolada | "
-                f"Evento Nº{evento_n} no ciclo atual | "
+                f"RISCO FB14 — Leitura Anomala Isolada | "
+                f"Evento No{evento_n} no ciclo atual | "
                 f"Dia {int(features.age_days)} | {min_str} N"
             ),
             idade_maintacker = int(features.age_days),
@@ -478,18 +455,52 @@ class RiscoTrigger(TriggerBase):
 
 
 class CriticoTrigger(TriggerBase):
-    """Força crítica confirmada + p_risk ≥ 0.40 — Análise aprofundada + planejamento."""
+    """
+    Degradação + envelhecimento com severidade graduada (v4.0).
+
+    Sub-níveis avaliados em ordem decrescente de urgência:
+      FIM_DE_VIDA : age >= eta_ajustado - fim_de_vida_dias_antes
+      CONFIRMADO  : condições RED (C1 AND C2 AND C3 AND C4)
+                    OU força critica confirmada (min < 800 + p_risk >= limiar)
+      AVISO       : aviso precoce — p_risk >= limiar_aviso OU sig >= limiar_sig
+    """
     name      = "CRITICO"
-    severity  = "ALTA"
     state_key = "critico"
 
     def __init__(self, cfg: dict) -> None:
         super().__init__(cfg)
-        self.forca_min    = float(cfg.get("critico_forca_min",  CRITICO_FORCA_MIN))
-        self.p_risk_min   = float(cfg.get("critico_p_risk_min", CRITICO_P_RISK_MIN))
-        self.cooldown_h   = float(cfg.get("critico_cooldown_h", CRITICO_COOLDOWN_H))
-        self._mediana_ok  = float(cfg.get("risco_mediana_ok",   RISCO_MEDIANA_OK))
-        self._risco_n_max = int(cfg.get("risco_n_max",          RISCO_N_MAX))
+        # AVISO
+        self.aviso_p_risk   = float(cfg.get("amarelo_p_risk",      AVISO_P_RISK))
+        self.aviso_signal   = float(cfg.get("amarelo_signal",      AVISO_SIGNAL))
+        self.aviso_cooldown = float(cfg.get("amarelo_cooldown_h",  AVISO_COOLDOWN_H))
+        # CONFIRMADO — RED
+        self.limiar_p_risk       = float(cfg.get("limiar_p_risk",       LIMIAR_P_RISK))
+        self.limiar_signal_score = float(cfg.get("limiar_signal_score", LIMIAR_SIGNAL_SCORE))
+        self.idade_minima_dias   = float(cfg.get("idade_minima_dias",   IDADE_MINIMA_DIAS))
+        self.proj_48h_limiar     = float(cfg.get("proj_48h_limiar",     PROJ_48H_LIMIAR))
+        self.sustentacao_proj    = int(cfg.get("sustentacao_proj_dias", SUSTENTACAO_PROJ_DIAS))
+        self.confirmado_cooldown = float(cfg.get("cooldown_h",          COOLDOWN_H))
+        # CONFIRMADO — força crítica
+        self.forca_critica_min   = float(cfg.get("critico_forca_min",  CRITICO_FORCA_MIN))
+        self.forca_critica_p_risk= float(cfg.get("critico_p_risk_min", CRITICO_P_RISK_MIN))
+        self._mediana_ok         = float(cfg.get("risco_mediana_ok",   RISCO_MEDIANA_OK))
+        self._risco_n_max        = int(cfg.get("risco_n_max",          RISCO_N_MAX))
+        self.snooze_dias         = int(cfg.get("snooze_dias",          SNOOZE_DIAS))
+        # FIM_DE_VIDA
+        self.fim_de_vida_antes   = float(cfg.get("fim_de_vida_dias_antes", FIM_DE_VIDA_DIAS_ANTES))
+        self.fim_de_vida_cooldown= float(cfg.get("fim_de_vida_cooldown_h", FIM_DE_VIDA_COOLDOWN_H))
+
+        self._sub_nivel: Optional[str] = None
+
+    def default_state(self) -> dict:
+        return {
+            "sp_id":                  None,
+            "last_fired_aviso":       None,
+            "last_fired_confirmado":  None,
+            "last_fired_fim_de_vida": None,
+            "snooze_until":           None,
+            "proj_window":            [],
+        }
 
     def _is_outlier(self, features: TriggerFeatures) -> bool:
         return (
@@ -498,331 +509,138 @@ class CriticoTrigger(TriggerBase):
             and features.mediana_3d > self._mediana_ok
         )
 
-    def check(self, features: TriggerFeatures, state: dict) -> bool:
-        if features.age_days < 5:
-            return False
-        if np.isnan(features.min_3d) or features.min_3d >= self.forca_min:
-            return False
-        if features.p_risk < self.p_risk_min:
-            return False
-        if _in_cooldown(state[self.state_key].get("last_fired"), self.cooldown_h, features.today):
-            return False
-        return not self._is_outlier(features)
-
-    def build_event(self, maquina: str, features: TriggerFeatures,
-                    state: dict) -> TriggerEvent:
-        evento_n = state.get("eventos_risco_ciclo", 0) + 1
-        min_str  = f"{features.min_3d:.0f}" if not np.isnan(features.min_3d) else "N/D"
-        acao = "Análise aprofundada e planejamento de troca do rolo maintacker."
-        return TriggerEvent(
-            maquina          = maquina,
-            gatilho          = self.name,
-            severidade       = self.severity,
-            mensagem         = (
-                f"CRÍTICO FB14 — Força Crítica + Risco Elevado | "
-                f"Evento Nº{evento_n} no ciclo atual | "
-                f"Dia {int(features.age_days)} | {min_str} N | p_risk={features.p_risk:.2f}"
-            ),
-            idade_maintacker = int(features.age_days),
-            data_disparo     = features.today.isoformat(),
-            acao_recomendada = acao,
-            evento_no_ciclo  = evento_n,
-            score_atual      = round(features.p_risk, 4),
-            slope_forca_7d   = round(features.slope_7d, 1),
-            forca_minima_3d  = round(features.min_3d, 1) if not np.isnan(features.min_3d) else None,
-        )
-
-    def update_state(self, state: dict, ts: str) -> None:
-        state[self.state_key]["last_fired"] = ts
-        state["eventos_risco_ciclo"] = state.get("eventos_risco_ciclo", 0) + 1
-
-
-class EmergencialTrigger(TriggerBase):
-    """
-    Avaliação cumulativa do ciclo — Retenção iminente.
-
-    Dispara quando o quadro completo indica fim de vida próximo:
-    ≥ N eventos força < 800 N + idade ≥ frac × eta_ajustado
-    + p_risk ≥ limiar + MM7d declinante.
-    """
-    name      = "EMERGENCIAL"
-    severity  = "CRITICA"
-    state_key = "emergencial"
-
-    def __init__(self, cfg: dict) -> None:
-        super().__init__(cfg)
-        self.min_eventos = int(cfg.get("emergencial_min_eventos",  EMERGENCIAL_MIN_EVENTOS))
-        self.idade_frac  = float(cfg.get("emergencial_idade_frac", EMERGENCIAL_IDADE_FRAC))
-        self.p_risk_min  = float(cfg.get("emergencial_p_risk_min", EMERGENCIAL_P_RISK_MIN))
-        self.cooldown_h  = float(cfg.get("emergencial_cooldown_h", EMERGENCIAL_COOLDOWN_H))
-
-    def check(self, features: TriggerFeatures, state: dict) -> bool:
-        if _in_cooldown(state[self.state_key].get("last_fired"), self.cooldown_h, features.today):
-            return False
-        if state.get("eventos_risco_ciclo", 0) < self.min_eventos:
-            return False
-        if features.age_days < features.eta_ajustado_dias * self.idade_frac:
-            return False
-        if features.p_risk < self.p_risk_min:
-            return False
-        if (not np.isnan(features.mean_7d) and not np.isnan(features.mean_7d_3d_ago)
-                and features.mean_7d >= features.mean_7d_3d_ago):
-            return False
-        return True
-
-    def build_event(self, maquina: str, features: TriggerFeatures,
-                    state: dict) -> TriggerEvent:
-        min_str = f"{features.min_3d:.0f}" if not np.isnan(features.min_3d) else "N/D"
-        acao = "Risco iminente de retenção — acionar troca imediata do rolo maintacker."
-        return TriggerEvent(
-            maquina          = maquina,
-            gatilho          = self.name,
-            severidade       = self.severity,
-            mensagem         = (
-                f"EMERGENCIAL FB14 — Risco Iminente de Retenção | "
-                f"Evento Nº{features.eventos_risco_ciclo} no ciclo | "
-                f"Dia {int(features.age_days)} | {min_str} N | p_risk={features.p_risk:.2f}"
-            ),
-            idade_maintacker = int(features.age_days),
-            data_disparo     = features.today.isoformat(),
-            acao_recomendada = acao,
-            evento_no_ciclo  = features.eventos_risco_ciclo,
-            score_atual      = round(features.p_risk, 4),
-            slope_forca_7d   = round(features.slope_7d, 1),
-            forca_minima_3d  = round(features.min_3d, 1) if not np.isnan(features.min_3d) else None,
-        )
-
-
-class RedTrigger(TriggerBase):
-    """Gatilho principal: C1 AND C2 AND C3 AND C4."""
-    name      = "RED"
-    severity  = "ALTA"
-    state_key = "red"
-    sp_id_key = "red_sp_id"
-
-    def __init__(self, cfg: dict) -> None:
-        super().__init__(cfg)
-        self.limiar_p_risk       = float(cfg.get("limiar_p_risk",       LIMIAR_P_RISK))
-        self.limiar_signal_score = float(cfg.get("limiar_signal_score", LIMIAR_SIGNAL_SCORE))
-        self.idade_minima_dias   = float(cfg.get("idade_minima_dias",   IDADE_MINIMA_DIAS))
-        self.proj_48h_limiar     = float(cfg.get("proj_48h_limiar",     PROJ_48H_LIMIAR))
-        self.sustentacao_proj    = int(cfg.get("sustentacao_proj_dias", SUSTENTACAO_PROJ_DIAS))
-        self.cooldown_h          = float(cfg.get("cooldown_h",          COOLDOWN_H))
-        self.snooze_dias         = int(cfg.get("snooze_dias",           SNOOZE_DIAS))
-
-    def default_state(self) -> dict:
-        return {"red_sp_id": None, "last_fired": None, "snooze_until": None, "proj_window": []}
-
-    def check(self, features: TriggerFeatures, state: dict) -> bool:
+    def _get_sub_nivel(self, features: TriggerFeatures, state: dict) -> Optional[str]:
         e = state[self.state_key]
-        if _in_cooldown(e.get("last_fired"), self.cooldown_h, features.today):
-            return False
+
+        # FIM_DE_VIDA: prioridade máxima, ignora snooze
+        if features.age_days >= features.eta_ajustado_dias - self.fim_de_vida_antes:
+            if not _in_cooldown(e.get("last_fired_fim_de_vida"), self.fim_de_vida_cooldown, features.today):
+                return "FIM_DE_VIDA"
+
+        # Snooze bloqueia CONFIRMADO e AVISO
         if e.get("snooze_until"):
             if features.today <= _to_utc(e["snooze_until"]).normalize():
-                return False
+                return None
 
-        window = e.get("proj_window", [])
-        window.append({
-            "date": features.today.isoformat()[:10],
-            "proj": round(float(features.proj_48h), 1) if not np.isnan(features.proj_48h) else 9999.0,
-        })
-        e["proj_window"] = window[-5:]
-        n_below = sum(1 for d in e["proj_window"] if d["proj"] < self.proj_48h_limiar)
+        # CONFIRMADO
+        if not _in_cooldown(e.get("last_fired_confirmado"), self.confirmado_cooldown, features.today):
+            # Caminho força crítica
+            if (not np.isnan(features.min_3d)
+                    and features.min_3d < self.forca_critica_min
+                    and features.p_risk >= self.forca_critica_p_risk
+                    and features.age_days >= 5
+                    and not self._is_outlier(features)):
+                return "CONFIRMADO"
 
-        cond1 = features.p_risk    >= self.limiar_p_risk
-        cond2 = features.sig_score >= self.limiar_signal_score
-        cond3 = features.age_days  >= self.idade_minima_dias
-        cond4 = n_below            >= self.sustentacao_proj
-        logger.debug(
-            "[%s] RED | p_risk=%.3f(C1=%s) sig=%.3f(C2=%s) age=%.0fd(C3=%s) proj_below=%d/5(C4=%s)",
-            features.today.date(), features.p_risk, cond1, features.sig_score, cond2,
-            features.age_days, cond3, n_below, cond4,
-        )
-        return cond1 and cond2 and cond3 and cond4
+            # Caminho RED (C1 AND C2 AND C3 AND C4)
+            window = e.get("proj_window", [])
+            window.append({
+                "date": features.today.isoformat()[:10],
+                "proj": round(float(features.proj_48h), 1) if not np.isnan(features.proj_48h) else 9999.0,
+            })
+            e["proj_window"] = window[-5:]
+            n_below = sum(1 for d in e["proj_window"] if d["proj"] < self.proj_48h_limiar)
+
+            cond1 = features.p_risk    >= self.limiar_p_risk
+            cond2 = features.sig_score >= self.limiar_signal_score
+            cond3 = features.age_days  >= self.idade_minima_dias
+            cond4 = n_below            >= self.sustentacao_proj
+            logger.debug(
+                "[%s] CONFIRMADO | p_risk=%.3f(C1=%s) sig=%.3f(C2=%s) age=%.0fd(C3=%s) proj_below=%d/5(C4=%s)",
+                features.today.date(), features.p_risk, cond1, features.sig_score, cond2,
+                features.age_days, cond3, n_below, cond4,
+            )
+            if cond1 and cond2 and cond3 and cond4:
+                return "CONFIRMADO"
+
+        # AVISO
+        if features.age_days >= self.idade_minima_dias:
+            if not _in_cooldown(e.get("last_fired_confirmado"), self.confirmado_cooldown, features.today):
+                if not _in_cooldown(e.get("last_fired_aviso"), self.aviso_cooldown, features.today):
+                    cond_a = features.p_risk    >= self.aviso_p_risk
+                    cond_b = features.sig_score >= self.aviso_signal
+                    already_confirmado = (
+                        features.p_risk    >= self.limiar_p_risk
+                        and features.sig_score >= self.limiar_signal_score
+                    )
+                    if (cond_a or cond_b) and not already_confirmado:
+                        return "AVISO"
+
+        return None
+
+    def check(self, features: TriggerFeatures, state: dict) -> bool:
+        self._sub_nivel = self._get_sub_nivel(features, state)
+        return self._sub_nivel is not None
 
     def build_event(self, maquina: str, features: TriggerFeatures,
                     state: dict) -> TriggerEvent:
-        slope_str = f"{features.slope_7d:+.0f}"
-        proj_str  = f"{features.proj_48h:.0f}" if not np.isnan(features.proj_48h) else "N/D"
-        mean_str  = f"{features.mean_3d:.0f}"  if not np.isnan(features.mean_3d)  else "N/D"
-        mensagem = (
-            f"ALERTA FB14 (IC-I1-14) — Risco de Impacto na Força de Selagem\n"
-            f"Rolo ativo há {int(features.age_days)} dias | "
-            f"Força média 72h: {mean_str} N | "
-            f"Projeção 48h: {proj_str} N (tendência: {slope_str} N/dia)\n"
-            f"Probabilidade de impacto nas próximas 48-72h: {features.p_risk*100:.0f}%"
-        )
-        acao = (
-            "Programar inspeção preventiva do rolo. "
-            "Verificar força de selagem no próximo turno. "
-            "Registrar resultado: OK / Troca programada / Troca imediata."
-        )
+        sub      = self._sub_nivel
+        evento_n = state.get("eventos_risco_ciclo", 0) + 1
+        min_str  = f"{features.min_3d:.0f}" if not np.isnan(features.min_3d) else "N/D"
+
+        if sub == "FIM_DE_VIDA":
+            severidade   = "CRITICA"
+            dias_rest    = int(round(features.eta_ajustado_dias - features.age_days))
+            dias_str     = (f"{abs(dias_rest)} dias alem do ETA"
+                            if dias_rest < 0 else f"faltam {dias_rest} dias para o ETA")
+            mensagem     = (
+                f"CRITICO FB14 — Fim de Vida Projetado | "
+                f"Dia {int(features.age_days)} / ETA {int(features.eta_ajustado_dias)}d | {dias_str}"
+            )
+            acao = "Troca imediata do rolo maintacker — vida util projetada atingida."
+
+        elif sub == "CONFIRMADO":
+            severidade = "ALTA"
+            mensagem   = (
+                f"CRITICO FB14 — Degradacao + Risco Elevado | "
+                f"Evento No{evento_n} no ciclo | "
+                f"Dia {int(features.age_days)} | {min_str} N | p_risk={features.p_risk:.2f}"
+            )
+            acao = "Analise aprofundada e planejamento de troca do rolo maintacker."
+
+        else:  # AVISO
+            severidade = "MEDIA"
+            mean_str   = f"{features.mean_3d:.0f}" if not np.isnan(features.mean_3d) else "N/D"
+            razao      = ("risco em elevacao" if features.p_risk >= self.aviso_p_risk
+                          else "degradacao de sinal detectada")
+            mensagem   = (
+                f"CRITICO FB14 — Aviso Precoce | "
+                f"Dia {int(features.age_days)} | Forca media 72h: {mean_str} N | {razao}"
+            )
+            acao = (
+                "Aumentar frequencia de monitoramento do sinal de forca. "
+                "Registrar observacoes no proximo turno."
+            )
+
         return TriggerEvent(
             maquina          = maquina,
             gatilho          = self.name,
-            severidade       = self.severity,
+            sub_nivel        = sub,
+            severidade       = severidade,
             mensagem         = mensagem,
             idade_maintacker = int(features.age_days),
             data_disparo     = features.today.isoformat(),
             acao_recomendada = acao,
+            evento_no_ciclo  = evento_n if sub != "FIM_DE_VIDA" else 0,
             score_atual      = round(features.p_risk, 4),
             slope_forca_7d   = round(features.slope_7d, 1),
-            forca_minima_3d  = round(features.mean_3d, 1) if not np.isnan(features.mean_3d) else None,
+            forca_minima_3d  = round(features.min_3d, 1) if not np.isnan(features.min_3d) else None,
             proj_48h         = round(features.proj_48h, 1) if not np.isnan(features.proj_48h) else None,
             signal_score     = round(features.sig_score, 4),
             age_risk         = round(features.age_risk, 4),
         )
 
     def update_state(self, state: dict, ts: str) -> None:
-        state[self.state_key]["last_fired"] = ts
-        state[self.state_key]["red_sp_id"]  = -1
-
-
-class AmarelhoTrigger(TriggerBase):
-    """Aviso precoce de anomalia."""
-    name      = "AMARELO"
-    severity  = "MEDIA"
-    state_key = "amarelo"
-
-    def __init__(self, cfg: dict) -> None:
-        super().__init__(cfg)
-        self.amarelo_p_risk    = float(cfg.get("amarelo_p_risk",      AMARELO_P_RISK))
-        self.amarelo_signal    = float(cfg.get("amarelo_signal",      AMARELO_SIGNAL))
-        self.cooldown_h        = float(cfg.get("amarelo_cooldown_h",  AMARELO_COOLDOWN_H))
-        self.idade_minima_dias = float(cfg.get("idade_minima_dias",   IDADE_MINIMA_DIAS))
-        self.limiar_p_risk     = float(cfg.get("limiar_p_risk",       LIMIAR_P_RISK))
-        self.limiar_signal     = float(cfg.get("limiar_signal_score", LIMIAR_SIGNAL_SCORE))
-        self.red_cooldown_h    = float(cfg.get("cooldown_h",          COOLDOWN_H))
-
-    def check(self, features: TriggerFeatures, state: dict) -> bool:
-        if features.age_days < self.idade_minima_dias:
-            return False
-        if _in_cooldown(state["red"].get("last_fired"), self.red_cooldown_h, features.today):
-            return False
-        if _in_cooldown(state[self.state_key].get("last_fired"), self.cooldown_h, features.today):
-            return False
-        cond_a = features.p_risk    >= self.amarelo_p_risk
-        cond_b = features.sig_score >= self.amarelo_signal
-        if not (cond_a or cond_b):
-            return False
-        if (features.p_risk >= self.limiar_p_risk and features.sig_score >= self.limiar_signal
-                and features.age_days >= self.idade_minima_dias):
-            return False
-        return True
-
-    def build_event(self, maquina: str, features: TriggerFeatures,
-                    state: dict) -> TriggerEvent:
-        mean_str  = f"{features.mean_3d:.0f}" if not np.isnan(features.mean_3d) else "N/D"
-        slope_str = f"{features.slope_7d:+.0f}"
-        razao = "risco em elevação" if features.p_risk >= self.amarelo_p_risk else "degradação de sinal detectada"
-        mensagem = (
-            f"AVISO FB14 (IC-I1-14) — Anomalia Detectada no Sinal de Selagem\n"
-            f"Rolo ativo há {int(features.age_days)} dias | "
-            f"Força média 72h: {mean_str} N | Tendência: {slope_str} N/dia\n"
-            f"Probabilidade de impacto atual: {features.p_risk*100:.0f}% ({razao})\n"
-            "Monitoramento reforçado recomendado. Não requer ação imediata."
-        )
-        acao = (
-            "Aumentar frequência de monitoramento do sinal de força. "
-            "Registrar observações no próximo turno. "
-            "Aguardar evolução — sistema irá escalar para RED se tendência continuar."
-        )
-        return TriggerEvent(
-            maquina          = maquina,
-            gatilho          = self.name,
-            severidade       = self.severity,
-            mensagem         = mensagem,
-            idade_maintacker = int(features.age_days),
-            data_disparo     = features.today.isoformat(),
-            acao_recomendada = acao,
-            score_atual      = round(features.p_risk, 4),
-            slope_forca_7d   = round(features.slope_7d, 1),
-            forca_minima_3d  = round(features.min_3d, 1) if not np.isnan(features.min_3d) else None,
-            proj_48h         = round(features.proj_48h, 1) if not np.isnan(features.proj_48h) else None,
-            signal_score     = round(features.sig_score, 4),
-        )
-
-    def update_state(self, state: dict, ts: str) -> None:
-        state[self.state_key]["last_fired"] = ts
-        state[self.state_key]["sp_id"]      = -1
-
-
-class RevisaoTrigger(TriggerBase):
-    """Marco automático de ciclo — dias 20, 25, 35."""
-    name      = "REVISAO"
-    severity  = "INFO"
-    state_key = "revisao"
-    sp_id_key = None
-
-    def __init__(self, cfg: dict) -> None:
-        super().__init__(cfg)
-        marcos_raw = cfg.get("revisao_marcos_dias", REVISAO_MARCOS_DIAS)
-        self.marcos         = sorted(int(m) for m in marcos_raw)
-        self.amarelo_p_risk = float(cfg.get("amarelo_p_risk", AMARELO_P_RISK))
-        self.amarelo_signal = float(cfg.get("amarelo_signal", AMARELO_SIGNAL))
-        self.limiar_p_risk  = float(cfg.get("limiar_p_risk",  LIMIAR_P_RISK))
-        self._marco_ativo: Optional[int] = None
-
-    def default_state(self) -> dict:
-        return {"marcos_disparados": []}
-
-    def _get_marco(self, features: TriggerFeatures, state: dict) -> Optional[int]:
-        disparados = state[self.state_key].get("marcos_disparados", [])
-        for marco in self.marcos:
-            if features.age_days >= marco and marco not in disparados:
-                return marco
-        return None
-
-    def check(self, features: TriggerFeatures, state: dict) -> bool:
-        self._marco_ativo = self._get_marco(features, state)
-        return self._marco_ativo is not None
-
-    def build_event(self, maquina: str, features: TriggerFeatures,
-                    state: dict) -> TriggerEvent:
-        marco     = self._marco_ativo
-        mean_str  = f"{features.mean_3d:.0f}" if not np.isnan(features.mean_3d) else "N/D"
-        min_str   = f"{features.min_3d:.0f}"  if not np.isnan(features.min_3d)  else "N/D"
-        slope_str = f"{features.slope_7d:+.0f}"
-
-        if features.p_risk < 0.25 and features.sig_score < 0.10:
-            estado = "NORMAL — rolo com desempenho dentro do esperado"
-        elif features.p_risk < self.amarelo_p_risk and features.sig_score < self.amarelo_signal:
-            estado = "ATENÇÃO — sinais leves de desgaste, monitoramento normal"
-        elif features.p_risk < self.limiar_p_risk:
-            estado = "ELEVADO — degradação em andamento, monitoramento reforçado"
-        else:
-            estado = "CRÍTICO — condições de disparo RED iminentes"
-
-        proximo = next((m for m in self.marcos if m > marco), "N/A")
-        mensagem = (
-            f"REVISÃO AUTOMÁTICA FB14 (IC-I1-14) — Marco de Ciclo: Dia {marco}\n"
-            f"Rolo ativo há {int(features.age_days)} dias | Estado: {estado}\n"
-            f"Força média 72h: {mean_str} N | Mínimo 72h: {min_str} N | "
-            f"Tendência: {slope_str} N/dia\n"
-            f"Probabilidade de impacto acumulada: {features.p_risk*100:.0f}%"
-        )
-        acao = (
-            f"Revisar gráfico de tendência de força. "
-            f"Se forças abaixo de 900 N ou tendência negativa persistente, "
-            f"antecipar inspeção do rolo. Próximo marco automático: dia {proximo}."
-        )
-        return TriggerEvent(
-            maquina          = maquina,
-            gatilho          = self.name,
-            severidade       = self.severity,
-            mensagem         = mensagem,
-            idade_maintacker = int(features.age_days),
-            data_disparo     = features.today.isoformat(),
-            acao_recomendada = acao,
-            score_atual      = round(features.p_risk, 4),
-            slope_forca_7d   = round(features.slope_7d, 1),
-            forca_minima_3d  = round(features.min_3d, 1) if not np.isnan(features.min_3d) else None,
-            proj_48h         = round(features.proj_48h, 1) if not np.isnan(features.proj_48h) else None,
-            signal_score     = round(features.sig_score, 4),
-        )
-
-    def update_state(self, state: dict, ts: str) -> None:
-        state[self.state_key]["marcos_disparados"].append(self._marco_ativo)
+        sub = self._sub_nivel
+        e   = state[self.state_key]
+        if sub == "FIM_DE_VIDA":
+            e["last_fired_fim_de_vida"] = ts
+        elif sub == "CONFIRMADO":
+            e["last_fired_confirmado"] = ts
+            state["eventos_risco_ciclo"] = state.get("eventos_risco_ciclo", 0) + 1
+        else:  # AVISO
+            e["last_fired_aviso"] = ts
+            state["eventos_risco_ciclo"] = state.get("eventos_risco_ciclo", 0) + 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -830,9 +648,9 @@ class RevisaoTrigger(TriggerBase):
 # ─────────────────────────────────────────────────────────────────────────────
 class TriggerEngine:
     """
-    Motor de gatilho probabilístico multi-nível — v3.0
+    Motor de gatilho probabilístico — v4.0
 
-    Ordem de avaliação: RISCO → CRITICO → EMERGENCIAL → RED → AMARELO → REVISAO
+    Ordem de avaliação: RISCO → CRITICO (FIM_DE_VIDA > CONFIRMADO > AVISO)
     """
 
     def __init__(self, maquina: str, state_path: Path) -> None:
@@ -853,10 +671,6 @@ class TriggerEngine:
         self.triggers: List[TriggerBase] = [
             RiscoTrigger(cfg),
             CriticoTrigger(cfg),
-            EmergencialTrigger(cfg),
-            RedTrigger(cfg),
-            AmarelhoTrigger(cfg),
-            RevisaoTrigger(cfg),
         ]
 
     def evaluate(
@@ -869,13 +683,7 @@ class TriggerEngine:
         media_col: str = "Media",
         troca_dates: Optional[list] = None,
     ) -> List[TriggerEvent]:
-        """
-        Avalia todos os gatilhos para `today`.
-
-        Args:
-            media_col: coluna de força para degradação/projeção.
-                       min_3d, mediana_3d e n_leituras sempre usam "Media" bruta.
-        """
+        """Avalia todos os gatilhos para `today`."""
         if today is None:
             today = _to_utc(df_hourly.index[-1]).normalize()
         else:
@@ -942,7 +750,10 @@ class TriggerEngine:
         if fired:
             logger.info(
                 "[%s] Disparos: %s | p_risk=%.3f sig=%.3f proj=%.0f min3d=%.0f age=%dd n<800=%d eventos=%d",
-                today.date(), "+".join(ev.gatilho for ev in fired), p_risk, sig_score,
+                today.date(),
+                "+".join(f"{ev.gatilho}({ev.sub_nivel})" if ev.sub_nivel else ev.gatilho
+                         for ev in fired),
+                p_risk, sig_score,
                 proj_48h if not np.isnan(proj_48h) else -1,
                 min_3d   if not np.isnan(min_3d)   else -1,
                 int(age_days), n_abaixo, self.state.get("eventos_risco_ciclo", 0),
@@ -977,13 +788,12 @@ class TriggerEngine:
         if dias is None:
             dias = self.snooze_dias
         snooze_fim = (datetime.now() + timedelta(days=dias)).date().isoformat()
-        self.state["red"]["snooze_until"]   = snooze_fim
-        self.state["amarelo"]["last_fired"] = datetime.now().isoformat()
+        self.state["critico"]["snooze_until"] = snooze_fim
         if sp_client and sp_id and sp_id > 0:
             sp_client.update_list_items(list_name, [sp_id], "Status",    "SNOOZE")
             sp_client.update_list_items(list_name, [sp_id], "SnoozeFim", snooze_fim)
         _save_state(self.state, self.state_path)
-        logger.info("RED (ID=%s) em snooze até %s.", sp_id, snooze_fim)
+        logger.info("CRITICO (ID=%s) em snooze ate %s.", sp_id, snooze_fim)
 
     def _compute_vida_ref_ajustada(self, troca_dates: list) -> float:
         """V = Eta - (d × w) onde d = Eta - mean_vida_ano_vigente."""
@@ -1006,7 +816,6 @@ class TriggerEngine:
     def _persist(self, ev: TriggerEvent, trigger: TriggerBase,
                  features: TriggerFeatures, sp_client, list_name: str,
                  eta_ajustado_dias: float = 0.0) -> None:
-        # Monta o payload sempre — necessário mesmo em dry-run para diagnóstico
         try:
             if ev.gatilho == "RISCO":
                 from .card_formatter import build_risco_card
@@ -1024,6 +833,7 @@ class TriggerEngine:
                 from .card_formatter import build_critico_card
                 ev.teams_payload = build_critico_card(
                     maquina             = ev.maquina,
+                    sub_nivel           = ev.sub_nivel,
                     idade_dias          = ev.idade_maintacker,
                     p_risk              = features.p_risk,
                     slope_7d            = ev.slope_forca_7d,
@@ -1035,43 +845,14 @@ class TriggerEngine:
                     data_disparo        = datetime.fromisoformat(ev.data_disparo[:19]),
                     vida_ref_dias       = eta_ajustado_dias or self.weibull_eta_d,
                     eventos_risco_ciclo = ev.evento_no_ciclo,
-                )
-            elif ev.gatilho == "EMERGENCIAL":
-                from .card_formatter import build_emergencial_card
-                ev.teams_payload = build_emergencial_card(
-                    maquina             = ev.maquina,
-                    idade_dias          = ev.idade_maintacker,
-                    p_risk              = features.p_risk,
-                    slope_7d            = ev.slope_forca_7d,
-                    forca_min_3d        = features.min_3d if not np.isnan(features.min_3d) else None,
-                    proj_48h            = features.proj_48h if not np.isnan(features.proj_48h) else None,
-                    media_7d            = features.mean_7d if not np.isnan(features.mean_7d) else None,
-                    acao_recomendada    = ev.acao_recomendada,
-                    data_disparo        = datetime.fromisoformat(ev.data_disparo[:19]),
-                    vida_ref_dias       = eta_ajustado_dias or self.weibull_eta_d,
-                    eventos_risco_ciclo = features.eventos_risco_ciclo,
-                )
-            else:
-                from .card_formatter import build_alert_card
-                ev.teams_payload = build_alert_card(
-                    maquina              = ev.maquina,
-                    gatilho              = ev.gatilho,
-                    idade_dias           = ev.idade_maintacker,
-                    p_risk               = ev.score_atual or 0.0,
-                    slope_7d             = ev.slope_forca_7d,
-                    forca_min_3d         = ev.forca_minima_3d,
-                    proj_48h             = ev.proj_48h,
-                    acao_recomendada     = ev.acao_recomendada,
-                    data_disparo         = datetime.fromisoformat(ev.data_disparo[:19]),
-                    vida_ref_dias        = eta_ajustado_dias or self.weibull_eta_d,
-                    n_abaixo_800_ciclo   = features.eventos_risco_ciclo,
-                    forca_min_ciclo      = features.forca_min_ciclo,
+                    forca_min_ciclo     = features.forca_min_ciclo if not np.isnan(features.forca_min_ciclo) else None,
                 )
         except Exception as exc:
             logger.warning("card build falhou (%s) — TeamsPayload omitido.", exc)
 
         if sp_client is None:
-            logger.warning("[dry-run] %s não persistido (sp_client=None).", ev.gatilho)
+            logger.warning("[dry-run] %s(%s) nao persistido (sp_client=None).",
+                           ev.gatilho, ev.sub_nivel)
             return
 
         _SP_CAMPOS_ATIVOS = {"Title", "Maquina", "TeamsPayload"}
@@ -1082,9 +863,10 @@ class TriggerEngine:
             ev.sp_item_id = ids[0]
             if trigger.sp_id_key is not None:
                 self.state[trigger.state_key][trigger.sp_id_key] = ids[0]
-            logger.info("%s inserido na lista '%s' (ID=%s).", ev.gatilho, list_name, ids[0])
+            logger.info("%s(%s) inserido na lista '%s' (ID=%s).",
+                        ev.gatilho, ev.sub_nivel, list_name, ids[0])
         else:
-            logger.warning("%s inserido mas ID não retornado.", ev.gatilho)
+            logger.warning("%s(%s) inserido mas ID nao retornado.", ev.gatilho, ev.sub_nivel)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1135,10 +917,8 @@ def compute_p_risk_snapshot(
         "age_risk":              round(age_risk,  4),
         "sig_score":             round(sig_score, 4),
         "p_risk":                round(p_risk,    4),
-        "cond_p_risk":           p_risk    >= LIMIAR_P_RISK,
-        "cond_signal":           sig_score >= LIMIAR_SIGNAL_SCORE,
-        "cond_idade":            age_days  >= IDADE_MINIMA_DIAS,
-        "cond_proj":             proj_48h  <  PROJ_48H_LIMIAR if not np.isnan(proj_48h) else False,
-        "cond_critico":          not np.isnan(min_3d) and min_3d < CRITICO_FORCA_MIN,
+        "cond_aviso":            (p_risk >= AVISO_P_RISK or sig_score >= AVISO_SIGNAL) and age_days >= IDADE_MINIMA_DIAS,
+        "cond_confirmado_red":   p_risk >= LIMIAR_P_RISK and sig_score >= LIMIAR_SIGNAL_SCORE and age_days >= IDADE_MINIMA_DIAS,
+        "cond_confirmado_forca": not np.isnan(min_3d) and min_3d < CRITICO_FORCA_MIN,
         "cond_risco":            is_risco,
     }
