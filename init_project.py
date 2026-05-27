@@ -58,18 +58,18 @@ _DEFAULT_TRIGGER = {
 
 
 def _classify_display_items(display_df):
-    """Separa sinais de força e SKU pelo nome (sem interação do usuário)."""
-    force_rows, sku_rows = [], []
+    """Separa sinais de força e phantom pelo nome (sem interação do usuário)."""
+    force_rows, phantom_rows = [], []
     for _, row in display_df.iterrows():
         name_lower = str(row.get("Name", "")).lower()
         if any(kw in name_lower for kw in _SKU_KEYWORDS):
-            sku_rows.append(row)
+            phantom_rows.append(row)
         else:
             force_rows.append(row)
-    return force_rows, sku_rows
+    return force_rows, phantom_rows
 
 
-def _build_config(workbook_id, worksheet_name, force_rows, sku_rows,
+def _build_config(workbook_id, worksheet_name, force_rows, phantom_rows,
                   time_delta_days=1460, iqr_multiplier=1.0, maquina=None):
     signals_cfg = [
         {"id": force_rows[0]["ID"], "name": "Forca_A",
@@ -77,11 +77,10 @@ def _build_config(workbook_id, worksheet_name, force_rows, sku_rows,
         {"id": force_rows[1]["ID"], "name": "Forca_B",
          "original_name": force_rows[1]["Name"], "type": "Signal"},
     ]
-    sku_cfg = [
-        {"id": r["ID"], "name": f"bag{i}_sku",
-         "original_name": r["Name"], "type": "Signal"}
-        for i, r in enumerate(sku_rows[:2], 1)
-    ]
+    phantom_cfg = [
+        {"id": phantom_rows[0]["ID"], "name": "phantom",
+         "original_name": phantom_rows[0]["Name"], "type": "Signal"},
+    ] if phantom_rows else []
     return {
         "project": {
             "workbook_id":    workbook_id,
@@ -89,8 +88,8 @@ def _build_config(workbook_id, worksheet_name, force_rows, sku_rows,
             "maquina":        maquina or worksheet_name,
             "time_delta_days": time_delta_days,
         },
-        "signals":     signals_cfg,
-        "sku_signals": sku_cfg,
+        "signals":         signals_cfg,
+        "phantom_signals": phantom_cfg,
         "preprocessing": {
             "delta_col_a":    "Forca_A",
             "delta_col_b":    "Forca_B",
@@ -111,7 +110,7 @@ def init_from_url(worksheet_url: str, config_path: str = "config.yaml",
         init_from_url("https://kcc.seeq.site/workbook/XXXX/worksheet/YYYY")
 
     Classificação automática:
-      • Nome contém MES / Phantom / Code / SKU / Product → sku_signals
+      • Nome contém MES / Phantom / Code / SKU / Product / Bagger → phantom_signals
       • Demais sinais → Forca_A (1º no display) e Forca_B (2º no display)
     """
     from seeq import spy
@@ -141,14 +140,14 @@ def init_from_url(worksheet_url: str, config_path: str = "config.yaml",
     print(f"Worksheet: {ws.name!r}")
 
     df = ws.display_items
-    force_rows, sku_rows = _classify_display_items(df)
+    force_rows, phantom_rows = _classify_display_items(df)
 
     print(f"\nClassificação automática:")
-    print(f"  Força  ({len(force_rows)} sinais):")
+    print(f"  Força    ({len(force_rows)} sinais):")
     for i, r in enumerate(force_rows):
         print(f"    [{i}] {r['Name']}  →  {r['ID']}")
-    print(f"  SKU    ({len(sku_rows)} sinais):")
-    for r in sku_rows:
+    print(f"  Phantom  ({len(phantom_rows)} sinais):")
+    for r in phantom_rows:
         print(f"    {r['Name']}  →  {r['ID']}")
 
     if len(force_rows) < 2:
@@ -156,11 +155,11 @@ def init_from_url(worksheet_url: str, config_path: str = "config.yaml",
             f"Esperava ≥ 2 sinais de força, encontrou {len(force_rows)}.\n"
             "Verifique os nomes dos sinais ou use init_project.py interativo."
         )
-    if not sku_rows:
-        print("\n⚠  Nenhum sinal SKU detectado. Normalização por produto desativada.")
+    if not phantom_rows:
+        print("\n⚠  Nenhum sinal Phantom detectado. Normalização por campanha desativada.")
 
     config = _build_config(
-        workbook_id, ws.name, force_rows, sku_rows,
+        workbook_id, ws.name, force_rows, phantom_rows,
         time_delta_days=time_delta_days, iqr_multiplier=iqr_multiplier,
         maquina=ws.name,
     )
@@ -169,9 +168,9 @@ def init_from_url(worksheet_url: str, config_path: str = "config.yaml",
         yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
     print(f"\n✓ {config_path} criado.")
-    print(f"  Forca_A  : {config['signals'][0]['id']}")
-    print(f"  Forca_B  : {config['signals'][1]['id']}")
-    for s in config['sku_signals']:
+    print(f"  Forca_A : {config['signals'][0]['id']}")
+    print(f"  Forca_B : {config['signals'][1]['id']}")
+    for s in config['phantom_signals']:
         print(f"  {s['name']:8}: {s['id']}")
     print("\nPróximos passos:")
     print("  1. Gerar troca_modulo.csv (SAP IW38 → extrair_troca_modulo.py)")
@@ -401,20 +400,18 @@ def _pick_two_signals(signals_df):
 
 # ── SKU signal picker ────────────────────────────────────────────────────────
 
-def select_sku_signals(spy):
-    """Pede a URL da worksheet de SKU, lista os sinais via spy.search() e
-    pede ao usuário para identificar bag1 e bag2.
+def select_phantom_signal(spy):
+    """Pede a URL da worksheet com o sinal de Phantom Code e retorna sua config.
 
     Usa spy.search() (só metadados) — nunca spy.pull() — para evitar
     PIException de outros sinais corrompidos na mesma worksheet.
     """
-    print("\n--- SKU Signal Selection ---")
-    print("Cole a URL completa da worksheet que contém os sinais de produto (bag1/bag2).")
+    print("\n--- Phantom Signal Selection ---")
+    print("Cole a URL completa da worksheet que contém o sinal de Phantom Code.")
     print("Exemplo: https://kcc.seeq.site/workbook/WORKBOOK-ID/worksheet/WORKSHEET-ID")
-    url = ask("URL da worksheet de SKU").strip()
+    url = ask("URL da worksheet de Phantom").strip()
 
     print("\nBuscando sinais (apenas metadados, sem pull)...")
-    import pandas as pd
     items_df = spy.search(url)
 
     if items_df is None or items_df.empty:
@@ -433,25 +430,19 @@ def select_sku_signals(spy):
     for i, row in signals_df.iterrows():
         print(f"  [{i}]  {str(row['Name'])[:80]}")
 
-    def pick(label):
-        while True:
-            idx = ask(f"\n  Índice do sinal para {label}")
-            try:
-                row = signals_df.iloc[int(idx)]
-                print(f"    -> {row['Name']}")
-                return row
-            except (ValueError, IndexError):
-                print("    Índice inválido, tente novamente.")
-
     print()
-    print("Identifique qual sinal representa cada bagger.")
-    print("(Procure por nomes como B1_Product, Bagger1, bag1, etc.)")
-    row_b1 = pick("Bagger 1 — SKU do produto (bag1_sku)")
-    row_b2 = pick("Bagger 2 — SKU do produto (bag2_sku)")
+    print("Selecione o sinal de Phantom Code (ex: Phantom Code, MES_Phantom, bag1_sku).")
+    while True:
+        idx = ask("  Índice do sinal de Phantom")
+        try:
+            row = signals_df.iloc[int(idx)]
+            print(f"    → {row['Name']}")
+            break
+        except (ValueError, IndexError):
+            print("    Índice inválido, tente novamente.")
 
     return [
-        {"id": row_b1["ID"], "name": "bag1_sku", "original_name": row_b1["Name"], "type": "Signal"},
-        {"id": row_b2["ID"], "name": "bag2_sku", "original_name": row_b2["Name"], "type": "Signal"},
+        {"id": row["ID"], "name": "phantom", "original_name": row["Name"], "type": "Signal"},
     ]
 
 
@@ -506,9 +497,9 @@ def main():
         workbook_id = search_workbook_by_name(spy)
         signals     = select_signals_from_workbook(spy, workbook_id)
 
-    sku_signals = select_sku_signals(spy)
-    time_delta  = ask_time_delta()
-    iqr_mult    = ask_iqr_multiplier()
+    phantom_signals = select_phantom_signal(spy)
+    time_delta      = ask_time_delta()
+    iqr_mult        = ask_iqr_multiplier()
 
     # ── Montar config ─────────────────────────────────────────────────────────
     project_section = {"workbook_id": workbook_id, "time_delta_days": time_delta}
@@ -516,9 +507,9 @@ def main():
         project_section["worksheet_name"] = worksheet_name
 
     config = {
-        "project":     project_section,
-        "signals":     signals,
-        "sku_signals": sku_signals,
+        "project":         project_section,
+        "signals":         signals,
+        "phantom_signals": phantom_signals,
         "preprocessing": {
             "delta_col_a":    "Forca_A",
             "delta_col_b":    "Forca_B",
