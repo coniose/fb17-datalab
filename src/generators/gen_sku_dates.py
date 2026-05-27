@@ -74,10 +74,11 @@ def run(
     user_tz = spy.utils.get_user_timezone(spy.session)
     end_time = pd.Timestamp.now(tz=user_tz)
 
-    # PI Historian pode ter registros corrompidos em períodos antigos (-11002).
+    # PI Historian pode ter registros corrompidos (-11002 Record Header Data Mismatch).
     # Tenta janelas progressivamente menores até obter dados.
-    _fallback_days = [time_delta_days, 730, 365, 180, 90]
+    _fallback_days = [time_delta_days, 730, 365, 180, 90, 60, 30, 14]
     raw = None
+    last_err = None
     for days in _fallback_days:
         start_time = end_time - pd.Timedelta(days=days)
         try:
@@ -90,12 +91,15 @@ def run(
                 quiet=True,
             ).reset_index()
             if days < time_delta_days:
-                print(f"      ⚠ PI Archive Error — janela reduzida para {days} dias")
+                print(f"      ⚠ PI Archive corrompido — janela reduzida para {days} dias "
+                      f"(normalização phantom coberta apenas nos últimos {days} dias)")
             break
-        except Exception as e:
-            if days == _fallback_days[-1]:
+        except BaseException as e:
+            last_err = e
+            next_days = _fallback_days[_fallback_days.index(days) + 1] if days != _fallback_days[-1] else None
+            if next_days is None:
                 raise
-            print(f"      ⚠ Erro ao puxar {days}d ({type(e).__name__}), tentando {_fallback_days[_fallback_days.index(days)+1]}d...")
+            print(f"      ⚠ Erro ao puxar {days}d ({type(e).__name__}), tentando {next_days}d...")
             continue
 
     raw = raw.rename(columns=id_to_name)
