@@ -69,7 +69,7 @@ def _classify_display_items(display_df):
 
 
 def _build_config(workbook_id, worksheet_name, force_rows, sku_rows,
-                  time_delta_days=1460, iqr_multiplier=1.0):
+                  time_delta_days=1460, iqr_multiplier=1.0, maquina=None):
     signals_cfg = [
         {"id": force_rows[0]["ID"], "name": "Forca_A",
          "original_name": force_rows[0]["Name"], "type": "Signal"},
@@ -85,6 +85,7 @@ def _build_config(workbook_id, worksheet_name, force_rows, sku_rows,
         "project": {
             "workbook_id":    workbook_id,
             "worksheet_name": worksheet_name,
+            "maquina":        maquina or worksheet_name,
             "time_delta_days": time_delta_days,
         },
         "signals":     signals_cfg,
@@ -160,6 +161,7 @@ def init_from_url(worksheet_url: str, config_path: str = "config.yaml",
     config = _build_config(
         workbook_id, ws.name, force_rows, sku_rows,
         time_delta_days=time_delta_days, iqr_multiplier=iqr_multiplier,
+        maquina=ws.name,
     )
 
     with open(Path(config_path), "w", encoding="utf-8") as f:

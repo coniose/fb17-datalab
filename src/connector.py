@@ -12,6 +12,13 @@ def load_config(path=None):
         return yaml.safe_load(f)
 
 
+def load_maquina(path=None) -> str:
+    """Retorna project.maquina do config.yaml (fallback: worksheet_name)."""
+    cfg = load_config(path)
+    proj = cfg.get("project", {})
+    return proj.get("maquina") or proj.get("worksheet_name", "FB??")
+
+
 def search_workbooks(name, content_filter="all"):
     from seeq import spy
     return spy.workbooks.search({"Name": name}, content_filter=content_filter)
