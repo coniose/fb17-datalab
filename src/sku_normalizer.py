@@ -272,3 +272,210 @@ def resumo_catalog() -> pd.DataFrame:
              "demanda": "pesado" if v > 1.05 else ("leve" if v < 0.90 else "normal")}
             for k, v in sorted(SKU_CATALOG.items(), key=lambda x: -x[1])]
     return pd.DataFrame(rows)
+
+
+# ── Auto-calibração por phantom (sem catálogo estático) ──────────────────────
+
+def calibrar_fatores_phantom(
+    df_forca: pd.DataFrame,
+    df_phantom: pd.DataFrame,
+    troca_dates: list,
+    col_phantom: str = "bag1_sku",
+    col_media: str = "Media",
+    fresh_dias: int = 10,
+    min_obs: int = 5,
+    tolerancia: str = "3h",
+) -> dict:
+    """Calibra fatores de stress por phantom code a partir de dados históricos.
+
+    Para cada phantom code encontrado no histórico:
+      1. Identifica leituras dos primeiros `fresh_dias` dias de cada ciclo
+         (rolo novo = sem degradação por envelhecimento)
+      2. Calcula a força média nesse período fresco, por phantom
+      3. Normaliza pela mediana global das forças frescas
+
+    fresh_dias=10 : os primeiros 10 dias capturam a demanda do phantom antes
+    que o desgaste do rolo contamine a leitura. Phantoms com < `min_obs`
+    leituras frescas recebem fator=1.0 (baseline neutro).
+
+    Parameters
+    ----------
+    df_forca : pd.DataFrame
+        Deve ter coluna 'ts' (tz-aware, UTC) e col_media.
+    df_phantom : pd.DataFrame
+        Deve ter colunas 'index' (tz-aware) e col_phantom.
+    troca_dates : list
+        Lista de datetimes das trocas de rolo (UTC).
+    col_phantom : str
+        Nome da coluna de phantom no df_phantom.
+    col_media : str
+        Coluna de força bruta a calibrar.
+    fresh_dias : int
+        Dias iniciais de cada ciclo considerados como referência fresca.
+    min_obs : int
+        Mínimo de leituras frescas para incluir o phantom na calibração.
+    tolerancia : str
+        Tolerância para merge_asof entre força e phantom.
+
+    Returns
+    -------
+    dict
+        {phantom_code: fator}  — 1.0 = demanda de referência (mediana global)
+    """
+    if df_phantom is None or df_phantom.empty or col_phantom not in df_phantom.columns:
+        return {}
+
+    # Normalizar timestamps do phantom
+    ph = df_phantom[["index", col_phantom]].copy()
+    ph = ph.rename(columns={"index": "ts"})
+    ph["ts"] = pd.to_datetime(ph["ts"], utc=True)
+    ph = ph.dropna(subset=["ts"]).sort_values("ts")
+
+    # Merge força ↔ phantom (forward-fill dentro da tolerância)
+    forca = df_forca[["ts", col_media]].copy().sort_values("ts")
+    forca["ts"] = pd.to_datetime(forca["ts"], utc=True)
+
+    merged = pd.merge_asof(
+        forca,
+        ph.rename(columns={col_phantom: "_phantom"}),
+        on="ts",
+        direction="nearest",
+        tolerance=pd.Timedelta(tolerancia),
+    )
+
+    # Anotar horas desde a troca mais recente antes de cada leitura
+    troca_ts = sorted(pd.to_datetime(t, utc=True) for t in troca_dates)
+    horas = np.full(len(merged), np.nan)
+    for i, t in enumerate(troca_ts):
+        t_fim = troca_ts[i + 1] if i + 1 < len(troca_ts) else pd.Timestamp.max.tz_localize("UTC")
+        mask = (merged["ts"] >= t) & (merged["ts"] < t_fim)
+        horas[mask] = (merged.loc[mask, "ts"] - t).dt.total_seconds().values / 3600.0
+    merged["_horas"] = horas
+
+    # Filtrar janela fresca
+    fresh = merged[(merged["_horas"] >= 0) & (merged["_horas"] <= fresh_dias * 24)].copy()
+    fresh = fresh.dropna(subset=["_phantom", col_media])
+    if fresh.empty:
+        return {}
+
+    # Força média fresca por phantom
+    baseline = (
+        fresh.groupby("_phantom")[col_media]
+        .agg(["mean", "count"])
+        .rename(columns={"mean": "forca_fresca", "count": "n_obs"})
+    )
+    baseline = baseline[baseline["n_obs"] >= min_obs]
+    if baseline.empty:
+        return {}
+
+    mediana_global = float(baseline["forca_fresca"].median())
+    if mediana_global <= 0:
+        return {}
+
+    catalog = {
+        phantom: round(row["forca_fresca"] / mediana_global, 4)
+        for phantom, row in baseline.iterrows()
+    }
+    logger.debug(
+        "Phantom calibration: %d phantoms | mediana_fresca=%.1f N | range=%.3f–%.3f",
+        len(catalog), mediana_global, min(catalog.values()), max(catalog.values()),
+    )
+    return catalog
+
+
+def normalizar_media_phantom(
+    df_forca: pd.DataFrame,
+    df_phantom: pd.DataFrame,
+    troca_dates: list,
+    col_phantom: str = "bag1_sku",
+    col_media: str = "Media",
+    catalog: Optional[Dict] = None,
+    fresh_dias: int = 10,
+    tolerancia: str = "3h",
+) -> pd.DataFrame:
+    """Adiciona ``Media_norm`` ao dataframe de força — versão auto-calibrada.
+
+    Se ``catalog`` for fornecido, usa-o diretamente (retrocompatível com FB14).
+    Se ``catalog`` for None, calibra automaticamente via fresh-roller baseline
+    a partir de ``df_phantom`` e ``troca_dates``.
+
+    Parameters
+    ----------
+    df_forca : pd.DataFrame
+        Index = Timestamp tz-aware (ou coluna 'ts'), coluna col_media.
+    df_phantom : pd.DataFrame
+        Colunas 'index' (tz-aware) e col_phantom.
+    troca_dates : list
+        Lista de datetimes das trocas de rolo.
+    col_phantom : str
+        Coluna de phantom em df_phantom.
+    col_media : str
+        Coluna de força bruta (padrão: Media).
+    catalog : dict ou None
+        Catálogo pré-calibrado {phantom_code: fator}.
+        Se None, auto-calibra a partir dos dados.
+    fresh_dias : int
+        Dias iniciais usados na auto-calibração.
+    tolerancia : str
+        Tolerância para merge_asof.
+
+    Returns
+    -------
+    pd.DataFrame
+        df_forca com colunas adicionais: ``phantom_codigo``, ``phantom_fator``, ``Media_norm``.
+    """
+    if catalog is None:
+        catalog = calibrar_fatores_phantom(
+            df_forca, df_phantom, troca_dates,
+            col_phantom=col_phantom, col_media=col_media,
+            fresh_dias=fresh_dias, tolerancia=tolerancia,
+        )
+
+    if not catalog:
+        logger.warning("Catálogo de phantoms vazio — Media_norm não gerada.")
+        df_out = df_forca.copy()
+        df_out["phantom_codigo"] = None
+        df_out["phantom_fator"]  = 1.0
+        df_out["Media_norm"]     = df_out[col_media]
+        return df_out
+
+    # Preparar phantom df para merge
+    ph = df_phantom[["index", col_phantom]].copy()
+    ph = ph.rename(columns={"index": "ts", col_phantom: "phantom_codigo"})
+    ph["ts"] = pd.to_datetime(ph["ts"], utc=True)
+    ph = ph.dropna(subset=["ts"]).sort_values("ts")
+
+    # Preparar df_forca
+    df = df_forca.copy()
+    has_ts_index = isinstance(df.index, pd.DatetimeIndex)
+    if has_ts_index:
+        df = df.reset_index().rename(columns={df.index.name or "index": "ts"})
+    elif "ts" not in df.columns:
+        ts_col = df.columns[0]
+        df = df.rename(columns={ts_col: "ts"})
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+
+    # Alinhar timezone do phantom
+    forca_tz = df["ts"].dt.tz
+    if forca_tz is not None:
+        ph["ts"] = ph["ts"].dt.tz_convert(forca_tz)
+
+    merged = pd.merge_asof(
+        df.sort_values("ts"),
+        ph,
+        on="ts",
+        direction="nearest",
+        tolerance=pd.Timedelta(tolerancia),
+    )
+    merged["phantom_fator"] = merged["phantom_codigo"].map(
+        lambda c: catalog.get(c, FATOR_DESCONHECIDO)
+    )
+    merged["Media_norm"] = merged[col_media] / merged["phantom_fator"]
+
+    if has_ts_index:
+        merged = merged.set_index("ts").sort_index()
+
+    df_forca["phantom_codigo"] = merged["phantom_codigo"].values
+    df_forca["phantom_fator"]  = merged["phantom_fator"].values
+    df_forca["Media_norm"]     = merged["Media_norm"].values
+    return df_forca
