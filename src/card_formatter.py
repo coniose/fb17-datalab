@@ -261,7 +261,7 @@ def build_critico_card(
         {"title": "Força Mínima do Ciclo",     "value": _fmt_gf(forca_min_ciclo)},
         {"title": "< 800 gf no ciclo atual",   "value": f"{eventos_risco_ciclo}x"},
         {"title": "Média da Semana Atual",     "value": _fmt_gf(media_7d)},
-        {"title": "Média da Semana Retrasada", "value": _fmt_gf(media_7d_anterior)},
+        {"title": "Média da Semana Passada",   "value": _fmt_gf(media_7d_anterior)},
     ]
 
     card = {
