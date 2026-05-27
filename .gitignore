@@ -26,3 +26,4 @@ _Job Results/
 # Config local (machine-specific, nao versionar)
 config.yaml
 *.ipynb
+!init_project.ipynb
