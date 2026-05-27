@@ -438,7 +438,7 @@ class RiscoTrigger(TriggerBase):
             gatilho          = self.name,
             severidade       = self.severity,
             mensagem         = (
-                f"RISCO FB14 — Leitura Anomala Isolada | "
+                f"RISCO {maquina} — Leitura Anomala Isolada | "
                 f"Evento No{evento_n} no ciclo atual | "
                 f"Dia {int(features.age_days)} | {min_str} N"
             ),
@@ -587,7 +587,7 @@ class CriticoTrigger(TriggerBase):
             dias_str     = (f"{abs(dias_rest)} dias alem do ETA"
                             if dias_rest < 0 else f"faltam {dias_rest} dias para o ETA")
             mensagem     = (
-                f"CRITICO FB14 — Fim de Vida Projetado | "
+                f"CRITICO {maquina} — Fim de Vida Projetado | "
                 f"Dia {int(features.age_days)} / ETA {int(features.eta_ajustado_dias)}d | {dias_str}"
             )
             acao = "Troca imediata do rolo maintacker — vida util projetada atingida."
@@ -595,7 +595,7 @@ class CriticoTrigger(TriggerBase):
         elif sub == "CONFIRMADO":
             severidade = "ALTA"
             mensagem   = (
-                f"CRITICO FB14 — Degradacao + Risco Elevado | "
+                f"CRITICO {maquina} — Degradacao + Risco Elevado | "
                 f"Evento No{evento_n} no ciclo | "
                 f"Dia {int(features.age_days)} | {min_str} N | p_risk={features.p_risk:.2f}"
             )
@@ -607,7 +607,7 @@ class CriticoTrigger(TriggerBase):
             razao      = ("risco em elevacao" if features.p_risk >= self.aviso_p_risk
                           else "degradacao de sinal detectada")
             mensagem   = (
-                f"CRITICO FB14 — Aviso Precoce | "
+                f"CRITICO {maquina} — Aviso Precoce | "
                 f"Dia {int(features.age_days)} | Forca media 72h: {mean_str} N | {razao}"
             )
             acao = (
