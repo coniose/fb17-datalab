@@ -17,16 +17,12 @@ signals:
     original_name: "Full signal name from Seeq"
     type: Signal
 
-# IDs específicos dos sinais de SKU — NÃO use a URL da worksheet (puxa todos os
+# ID do sinal de Phantom Code — NÃO use a URL da worksheet (puxa todos os
 # sinais e falha se qualquer um deles tiver dados corrompidos no PI).
-sku_signals:
-  - id: "SIGNAL-ID-B1-PRODUCT"
-    name: bag1_sku
-    original_name: "B1_Product Code signal name from Seeq"
-    type: Signal
-  - id: "SIGNAL-ID-B2-PRODUCT"
-    name: bag2_sku
-    original_name: "B2_Product Code signal name from Seeq"
+phantom_signals:
+  - id: "SIGNAL-ID-PHANTOM"
+    name: phantom
+    original_name: "Phantom Code signal name from Seeq"
     type: Signal
 
 preprocessing:

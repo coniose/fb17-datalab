@@ -158,7 +158,7 @@ def run(
     if _phantom_path.exists():
         df_phantom = pd.read_csv(_phantom_path)
         df_phantom["index"] = pd.to_datetime(df_phantom["index"], utc=True)
-        df = normalizar_media_phantom(df, df_phantom, troca_dates, col_phantom="bag1_sku")
+        df = normalizar_media_phantom(df, df_phantom, troca_dates, col_phantom="phantom")
     else:
         df["Media_norm"]     = df["Media"]
         df["phantom_codigo"] = None
