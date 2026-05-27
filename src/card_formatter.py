@@ -14,7 +14,7 @@ import math
 from datetime import datetime
 from typing import Optional
 
-VIDA_REF_DIAS: float = 45.0
+VIDA_REF_DIAS: float = 54.0  # Weibull η em dias (1297h / 24)
 
 _CRITICO_META = {
     "AVISO": {
@@ -53,14 +53,6 @@ def _label_tendencia(slope_n_por_dia: Optional[float]) -> str:
         return f"Declinio leve ({val})"
     return f"Estavel ({val})"
 
-
-def _label_risco(p_risk: float) -> str:
-    pct = round(p_risk * 100)
-    if p_risk >= 0.60:
-        return f"Alto ({pct}%)"
-    if p_risk >= 0.35:
-        return f"Medio ({pct}%)"
-    return f"Baixo ({pct}%)"
 
 
 def _fmt_gf(v: Optional[float]) -> str:

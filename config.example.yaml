@@ -56,10 +56,10 @@ trigger:
   cooldown_h: 48                # horas de silêncio após disparo RED
   snooze_dias: 5                # dias de snooze após confirmação do operador
 
-  # ── Gatilho AMARELO — aviso precoce ───────────────────────────────────────
-  amarelo_p_risk: 0.35          # p_risk suficiente para aviso
-  amarelo_signal: 0.15          # OU signal_score acima deste patamar
-  amarelo_cooldown_h: 72        # horas de silêncio entre alertas AMARELO
+  # ── Gatilho AVISO — aviso precoce ────────────────────────────────────────
+  aviso_p_risk: 0.35            # p_risk suficiente para aviso
+  aviso_signal: 0.15            # OU signal_score acima deste patamar
+  aviso_cooldown_h: 72          # horas de silêncio entre alertas AVISO
 
   # ── Gatilho RISCO — leitura anômala isolada (INFO) ────────────────────────
   # Força < limiar, evento isolado (n ≤ risco_n_max) e sinal geral saudável.

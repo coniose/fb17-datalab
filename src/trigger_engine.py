@@ -470,9 +470,9 @@ class CriticoTrigger(TriggerBase):
     def __init__(self, cfg: dict) -> None:
         super().__init__(cfg)
         # AVISO
-        self.aviso_p_risk   = float(cfg.get("amarelo_p_risk",      AVISO_P_RISK))
-        self.aviso_signal   = float(cfg.get("amarelo_signal",      AVISO_SIGNAL))
-        self.aviso_cooldown = float(cfg.get("amarelo_cooldown_h",  AVISO_COOLDOWN_H))
+        self.aviso_p_risk   = float(cfg.get("aviso_p_risk",   cfg.get("amarelo_p_risk",     AVISO_P_RISK)))
+        self.aviso_signal   = float(cfg.get("aviso_signal",   cfg.get("amarelo_signal",     AVISO_SIGNAL)))
+        self.aviso_cooldown = float(cfg.get("aviso_cooldown_h", cfg.get("amarelo_cooldown_h", AVISO_COOLDOWN_H)))
         # CONFIRMADO — RED
         self.limiar_p_risk       = float(cfg.get("limiar_p_risk",       LIMIAR_P_RISK))
         self.limiar_signal_score = float(cfg.get("limiar_signal_score", LIMIAR_SIGNAL_SCORE))
