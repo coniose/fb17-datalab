@@ -18,7 +18,7 @@ VIDA_REF_DIAS: float = 45.0
 
 _CRITICO_META = {
     "AVISO": {
-        "style": "warning",
+        "style": "accent",
         "titulo": "AVISO — Degradacao Detectada",
         "bg": None,
     },
