@@ -284,7 +284,7 @@ if __name__ == "__main__":
 
     print("=== RISCO ===")
     print(build_risco_card(
-        maquina="FB14", idade_dias=8, forca_min=762.0,
+        maquina="FB17", idade_dias=8, forca_min=762.0,
         data_forca_min="2026-05-24", n_abaixo_800_ciclo=1,
         p_risk=0.12, media_3d=980.0,
         data_disparo=datetime(2026, 5, 26, 8, 0),
@@ -293,7 +293,7 @@ if __name__ == "__main__":
     for sub in ("AVISO", "CONFIRMADO", "FIM_DE_VIDA"):
         print(f"\n=== CRITICO / {sub} ===")
         print(build_critico_card(
-            maquina="FB14", sub_nivel=sub, idade_dias=38,
+            maquina="FB17", sub_nivel=sub, idade_dias=38,
             p_risk=0.72, slope_7d=-9.1, forca_min_3d=790.0,
             proj_48h=755.0, media_7d=820.0, media_7d_anterior=870.0,
             acao_recomendada="Troca do rolo maintacker urgente.",
