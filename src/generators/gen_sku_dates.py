@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-
 import pandas as pd
 
 _ROOT = Path(__file__).parent.parent.parent
@@ -52,7 +51,6 @@ def run(
 
     Raises:
         KeyError:  se config.yaml não tiver a seção phantom_signals.
-        ValueError: se nenhum sinal phantom for encontrado.
     """
     from seeq import spy
 
@@ -64,21 +62,22 @@ def run(
             "Adicione o ID do sinal de Phantom Code."
         )
 
-    id_to_name = {s["id"]: s["name"] for s in phantom_signals if s.get("id") and s.get("name")}
-    items_df = pd.DataFrame([
-        {"ID": s["id"], "Type": "Signal"}
-        for s in phantom_signals if s.get("id")
-    ])
+    # Só pega o primeiro ID de phantom válido
+    phantom = next((s for s in phantom_signals if s.get("id")), None)
+    if not phantom:
+        raise KeyError("Nenhum ID válido encontrado em phantom_signals.")
+
+    phantom_id = phantom["id"]
+
+    items_df = pd.DataFrame([{"ID": phantom_id, "Type": "Signal"}])
 
     time_delta_days = cfg.get("project", {}).get("time_delta_days", 1460)
     user_tz = spy.utils.get_user_timezone(spy.session)
     end_time = pd.Timestamp.now(tz=user_tz)
 
-    # PI Historian pode ter registros corrompidos (-11002 Record Header Data Mismatch).
-    # Tenta janelas progressivamente menores até obter dados.
+    # Tenta janelas progressivamente menores até obter dados
     _fallback_days = [time_delta_days, 730, 365, 180, 90, 60, 30, 14]
     raw = None
-    last_err = None
     for days in _fallback_days:
         start_time = end_time - pd.Timedelta(days=days)
         try:
@@ -91,27 +90,25 @@ def run(
                 quiet=True,
             ).reset_index()
             if days < time_delta_days:
-                print(f"      ⚠ PI Archive corrompido — janela reduzida para {days} dias "
-                      f"(normalização phantom coberta apenas nos últimos {days} dias)")
+                print(f"      ⚠ PI Archive corrompido — janela reduzida para {days} dias")
             break
-        except BaseException as e:
-            last_err = e
-            next_days = _fallback_days[_fallback_days.index(days) + 1] if days != _fallback_days[-1] else None
-            if next_days is None:
+        except Exception as e:
+            if days == _fallback_days[-1]:
                 raise
-            print(f"      ⚠ Erro ao puxar {days}d ({type(e).__name__}), tentando {next_days}d...")
+            print(f"      ⚠ Erro ao puxar {days}d ({type(e).__name__}), tentando próxima janela...")
             continue
 
-    raw = raw.rename(columns=id_to_name)
+    # Renomeia a coluna do ID para 'phantom'
+    raw = raw.rename(columns={phantom_id: "phantom"})
 
+    # Garante coluna 'phantom' presente
     if "phantom" not in raw.columns:
         raw["phantom"] = None
 
     raw["phantom"] = _phantom_to_str(raw["phantom"])
 
-    ts_col = next(
-        (c for c in raw.columns if c.lower() in ("index", "timestamp")), None
-    )
+    # Garante coluna 'index' como timestamp UTC
+    ts_col = next((c for c in raw.columns if c.lower() in ("index", "timestamp")), None)
     if ts_col and ts_col != "index":
         raw = raw.rename(columns={ts_col: "index"})
 
