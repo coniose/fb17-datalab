@@ -254,31 +254,15 @@ def build_critico_card(
             f"{dias_alem} dias alem do ETA"
         )
 
-    if sub_nivel == "FIM_DE_VIDA":
-        indicadores_facts = [
-            {"title": "Forca Minima (3 dias)",  "value": _fmt_gf(forca_min_3d)},
-            {"title": "Forca Projetada (48h)",  "value": _fmt_gf(proj_48h)},
-            {"title": "Media 7d atual",         "value": _fmt_gf(media_7d)},
-            {"title": "Tendencia de Forca",     "value": _label_tendencia(slope_7d)},
-            {"title": "Risco acumulado",        "value": _label_risco(p_risk)},
-        ]
-    elif sub_nivel == "CONFIRMADO":
-        indicadores_facts = [
-            {"title": "Tendência de Força",          "value": _label_tendencia(slope_7d)},
-            {"title": "Força Projetada (48h)",        "value": _fmt_gf(proj_48h)},
-            {"title": "Força Mínima (3 dias)",        "value": _fmt_gf(forca_min_3d)},
-            {"title": "Força Mínima do Ciclo",        "value": _fmt_gf(forca_min_ciclo)},
-            {"title": "< 800 gf no ciclo atual",      "value": f"{eventos_risco_ciclo}x"},
-            {"title": "Média da Semana Atual",        "value": _fmt_gf(media_7d)},
-            {"title": "Média da Semana Retrasada",    "value": _fmt_gf(media_7d_anterior)},
-        ]
-    else:  # AVISO
-        indicadores_facts = [
-            {"title": "Tendencia de Forca",    "value": _label_tendencia(slope_7d)},
-            {"title": "Forca Projetada (48h)", "value": _fmt_gf(proj_48h)},
-            {"title": "Media 7d atual",        "value": _fmt_gf(media_7d)},
-            {"title": "Risco acumulado",       "value": _label_risco(p_risk)},
-        ]
+    indicadores_facts = [
+        {"title": "Tendência de Força",        "value": _label_tendencia(slope_7d)},
+        {"title": "Força Projetada (48h)",     "value": _fmt_gf(proj_48h)},
+        {"title": "Força Mínima (3 dias)",     "value": _fmt_gf(forca_min_3d)},
+        {"title": "Força Mínima do Ciclo",     "value": _fmt_gf(forca_min_ciclo)},
+        {"title": "< 800 gf no ciclo atual",   "value": f"{eventos_risco_ciclo}x"},
+        {"title": "Média da Semana Atual",     "value": _fmt_gf(media_7d)},
+        {"title": "Média da Semana Retrasada", "value": _fmt_gf(media_7d_anterior)},
+    ]
 
     card = {
         "type": "AdaptiveCard",

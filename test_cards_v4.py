@@ -166,27 +166,33 @@ print("=" * 60)
 # ── Opcional: postar no SharePoint ────────────────────────────────────────────
 if POST_TO_SP:
     try:
-        import yaml
-        cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
-        sp_cfg = cfg.get("sharepoint", {})
+        from dotenv import dotenv_values
         from src.sharepoint_methods import SharePointClient
-        sp = SharePointClient(
-            url      = sp_cfg["url"],
-            username = sp_cfg["username"],
-            password = sp_cfg["password"],
-        )
-        list_name = cfg.get("sharepoint", {}).get("list_name", "Gatilhos_Selagem")
+
+        ev_path = Path("sharepoint.ev")
+        if not ev_path.exists():
+            raise FileNotFoundError("sharepoint.ev nao encontrado na raiz do projeto")
+
+        creds     = dotenv_values(ev_path)
+        sp        = SharePointClient(creds["SP_URL"], creds["SP_USER"], creds["SP_PASS"])
+        list_name = creds.get("SP_LIST", "Gatilhos_Selagem")
 
         print("\nPostando no SharePoint...")
+        ids_criados = []
         for label, json_str in payloads:
             item = {
-                "Title":        f"{MAQUINA} | TESTE | {label}",
+                "Title":        f"[TESTE] {MAQUINA} | {label}",
                 "Maquina":      MAQUINA,
                 "TeamsPayload": json_str,
             }
             ids = sp.insert_list_item(list_name, [item])
+            ids_criados.append(ids[0])
             print(f"  {label} -> ID {ids[0]}")
-        print("Pronto — verifique o canal do Teams.")
+
+        print(f"\nPronto — {len(ids_criados)} itens criados. Verifique o canal do Teams.")
+        print(f"Para limpar: IDs {ids_criados}")
+    except FileNotFoundError as e:
+        print(f"\n{e}")
+        print("Crie sharepoint.ev na raiz com SP_URL, SP_USER, SP_PASS (e opcionalmente SP_LIST).")
     except Exception as e:
         print(f"\nErro ao postar no SharePoint: {e}")
-        print("Verifique se config.yaml tem a secao [sharepoint] configurada.")
