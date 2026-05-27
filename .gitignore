@@ -1,0 +1,28 @@
+# Credenciais
+*.ev
+*.env
+
+# Dados gerados — não versionados (gerados pelo pipeline)
+*.csv
+*.json
+*.html
+*.zip
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+_Job*/
+_Job DataFrames/
+_Job Results/
+
+# IDE
+.vscode/
+.idea/
+
+# Config local (machine-specific, nao versionar)
+config.yaml
+*.ipynb
