@@ -23,12 +23,14 @@ import pandas as pd
 
 from src.connector import load_config
 from src.predictor import load_troca_dates
+from src.sku_normalizer import normalizar_media_phantom
 
 _ROOT = Path(__file__).parent.parent.parent
 
 COLUNAS_EXPORT = [
     "Timestamp", "ciclo_id", "horas_desde_troca",
-    "Forca_A", "Forca_B", "Media", "Delta_AB",
+    "Forca_A", "Forca_B", "Media", "Media_norm", "Delta_AB",
+    "phantom_codigo", "phantom_fator",
     # v1
     "slope_Media_7d", "pct_abaixo_800N_7d", "min_forca_3d", "cv_Delta_AB_7d",
     # v2
@@ -81,15 +83,16 @@ def _calcular_features_ciclo(
     mean3_arr: np.ndarray,
     mean14_arr: np.ndarray,
     forca_limiar: float,
+    media_col: str = "Media",
 ) -> None:
     """Preenche os arrays de features para um único ciclo (in-place)."""
     mask = df["ciclo_id"] == ciclo_id
     sub = df.loc[mask]
-    if sub["Media"].notna().sum() < 2:
+    if sub[media_col].notna().sum() < 2:
         return
 
     idx = mask.values.nonzero()[0]
-    media_s = pd.Series(sub["Media"].values, index=sub["ts"])
+    media_s = pd.Series(sub[media_col].values, index=sub["ts"])
     dab_s   = pd.Series(sub["Delta_AB"].values, index=sub["ts"])
     below_s = (media_s < forca_limiar).astype(float)
 
@@ -112,6 +115,7 @@ def run(
     output_path: str | Path = _ROOT / "notebooks" / "02_sinais_forca.csv",
     config_path: str | Path | None = None,
     troca_csv: str | Path | None = None,
+    phantom_csv: str | Path | None = None,
 ) -> pd.DataFrame:
     """
     Calcula features de força v1 e v2 a partir de 00_hour_prev.csv.
@@ -121,6 +125,9 @@ def run(
         output_path: Destino de 02_sinais_forca.csv.
         config_path: Caminho para config.yaml (usa padrão do projeto se None).
         troca_csv:   Caminho para troca_modulo.csv (busca automática se None).
+        phantom_csv: Caminho para sku_dates.csv com phantom codes.
+                     Se None, tenta notebooks/sku_dates.csv automaticamente.
+                     Se não existir, Media_norm não é gerada.
 
     Returns:
         DataFrame exportado (sem index).
@@ -146,7 +153,24 @@ def run(
     troca_dates = load_troca_dates(troca_csv)
     df = _atribuir_ciclos(df, troca_dates)
 
-    # 2. Arrays de destino
+    # 2. Normalização por phantom (auto-calibrada se sku_dates.csv disponível)
+    _phantom_path = Path(phantom_csv) if phantom_csv else _ROOT / "notebooks" / "sku_dates.csv"
+    if _phantom_path.exists():
+        df_phantom = pd.read_csv(_phantom_path)
+        df_phantom["index"] = pd.to_datetime(df_phantom["index"], utc=True)
+        df = normalizar_media_phantom(df, df_phantom, troca_dates, col_phantom="phantom")
+    else:
+        df["Media_norm"]     = df["Media"]
+        df["phantom_codigo"] = None
+        df["phantom_fator"]  = 1.0
+
+    # Usar Media_norm nas features se disponível e com cobertura >= 50%
+    _media_col = "Media_norm" if (
+        "Media_norm" in df.columns
+        and df["Media_norm"].notna().mean() >= 0.5
+    ) else "Media"
+
+    # 3. Arrays de destino
     n = len(df)
     slope_arr  = np.full(n, np.nan)
     pct_arr    = np.full(n, np.nan)
@@ -155,7 +179,7 @@ def run(
     mean3_arr  = np.full(n, np.nan)
     mean14_arr = np.full(n, np.nan)
 
-    # 3. Features cycle-aware (loop por ciclo)
+    # 4. Features cycle-aware (loop por ciclo)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for cid in sorted(df["ciclo_id"].unique()):
@@ -166,6 +190,7 @@ def run(
                 slope_arr, pct_arr, min3d_arr, cv_dab_arr,
                 mean3_arr, mean14_arr,
                 forca_limiar,
+                media_col=_media_col,
             )
 
     df["slope_Media_7d"]     = slope_arr
@@ -175,7 +200,7 @@ def run(
     df["mean_3d"]            = mean3_arr
     df["mean_14d"]           = mean14_arr
 
-    # 4. Features v2 — vetorizadas
+    # 5. Features v2 — vetorizadas
     with np.errstate(invalid="ignore", divide="ignore"):
         ratio    = np.where(mean14_arr > 0, mean3_arr / mean14_arr, np.nan)
         deg      = np.clip(1.0 - ratio, 0.0, None)
@@ -207,7 +232,7 @@ def run(
     df["age_risk"]     = age_risk
     df["p_risk"]       = p_risk
 
-    # 5. Exportar
+    # 6. Exportar
     df = df.rename(columns={"ts": "Timestamp"})
     cols = [c for c in COLUNAS_EXPORT if c in df.columns]
     out = df[cols]
@@ -227,6 +252,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", default=str(_ROOT / "notebooks" / "02_sinais_forca.csv"))
     parser.add_argument("--config", default=None)
     parser.add_argument("--troca-csv", default=None)
+    parser.add_argument("--phantom-csv", default=None,
+                        help="sku_dates.csv com phantom codes (auto-detectado se omitido)")
     args = parser.parse_args()
 
     result = run(
@@ -234,5 +261,6 @@ if __name__ == "__main__":
         output_path=args.output,
         config_path=args.config,
         troca_csv=args.troca_csv,
+        phantom_csv=args.phantom_csv,
     )
     print(f"Salvo: {args.output}  ({len(result):,} linhas)")

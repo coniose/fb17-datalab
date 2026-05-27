@@ -1,18 +1,17 @@
 """
 Generator: sku_dates.csv
 
-Extrai dados de SKU (produto embalado nas baggers) via spy.pull() usando os
-IDs de sinal configurados em config.yaml (seção sku_signals).
+Extrai o sinal de Phantom Code via spy.pull() usando o ID configurado em
+config.yaml (seção phantom_signals).
 
-Puxa apenas os dois sinais de SKU — não a worksheet completa — evitando
+Puxa apenas o sinal de phantom — não a worksheet completa — evitando
 falhas causadas por outros sinais corrompidos no PI da mesma worksheet.
 
 Colunas de saída:
-  index      — timestamp (UTC)
-  bag1_sku   — SKU da bagger 1 (string, ex: "30246860")
-  bag2_sku   — SKU da bagger 2 (string, ex: "30246825")
+  index    — timestamp (UTC)
+  phantom  — código do phantom (string, ex: "30246860")
 
-Chamado por pipeline_producao.ipynb antes da etapa de normalização SKU.
+Chamado por pipeline_producao.ipynb antes da etapa de normalização.
 Pode ser executado diretamente via CLI para atualizar o CSV manualmente.
 """
 from __future__ import annotations
@@ -29,10 +28,8 @@ if _notebooks_dir.exists() and str(_notebooks_dir) not in sys.path:
 
 from src.connector import load_config
 
-COLUNAS_SAIDA = ["bag1_sku", "bag2_sku"]
 
-
-def _sku_to_str(series: pd.Series) -> pd.Series:
+def _phantom_to_str(series: pd.Series) -> pd.Series:
     """Converte série float (ex: 30246860.0) para string (ex: '30246860').
     Valores NaN permanecem None."""
     numeric = pd.to_numeric(series, errors="coerce")
@@ -44,34 +41,32 @@ def run(
     config_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """
-    Extrai SKU dos sinais Seeq configurados em sku_signals e salva sku_dates.csv.
+    Extrai Phantom Code do sinal Seeq configurado em phantom_signals e salva sku_dates.csv.
 
     Args:
         output_path:  Destino do CSV gerado.
         config_path:  Caminho para config.yaml (usa padrão do projeto se None).
 
     Returns:
-        DataFrame com colunas index, bag1_sku, bag2_sku.
+        DataFrame com colunas index, phantom.
 
     Raises:
-        KeyError:  se config.yaml não tiver a seção sku_signals.
-        ValueError: se nenhum sinal de SKU for encontrado.
+        KeyError:  se config.yaml não tiver a seção phantom_signals.
     """
     from seeq import spy
 
     cfg = load_config(config_path)
-    sku_signals = cfg.get("sku_signals", [])
-    if not sku_signals:
+    phantom_signals = cfg.get("phantom_signals", [])
+    if not phantom_signals:
         raise KeyError(
-            "config.yaml não tem a seção 'sku_signals'. "
-            "Adicione os IDs dos sinais bag1_sku e bag2_sku."
+            "config.yaml não tem a seção 'phantom_signals'. "
+            "Adicione o ID do sinal de Phantom Code."
         )
 
-    # Mapeia name → id para renomear após o pull
-    id_to_name = {s["id"]: s["name"] for s in sku_signals if s.get("id") and s.get("name")}
+    id_to_name = {s["id"]: s["name"] for s in phantom_signals if s.get("id") and s.get("name")}
     items_df = pd.DataFrame([
         {"ID": s["id"], "Type": "Signal"}
-        for s in sku_signals if s.get("id")
+        for s in phantom_signals if s.get("id")
     ])
 
     time_delta_days = cfg.get("project", {}).get("time_delta_days", 1460)
@@ -87,26 +82,20 @@ def run(
         header="ID",
     ).reset_index()
 
-    # Renomear IDs → bag1_sku / bag2_sku
     raw = raw.rename(columns=id_to_name)
 
-    # Garantir que ambas as colunas existam (bag2_sku pode estar ausente)
-    for col in COLUNAS_SAIDA:
-        if col not in raw.columns:
-            raw[col] = None
+    if "phantom" not in raw.columns:
+        raw["phantom"] = None
 
-    # Converter float → string limpa
-    for col in COLUNAS_SAIDA:
-        raw[col] = _sku_to_str(raw[col])
+    raw["phantom"] = _phantom_to_str(raw["phantom"])
 
-    # Normalizar coluna de timestamp para "index"
     ts_col = next(
         (c for c in raw.columns if c.lower() in ("index", "timestamp")), None
     )
     if ts_col and ts_col != "index":
         raw = raw.rename(columns={ts_col: "index"})
 
-    df_out = raw[["index"] + COLUNAS_SAIDA].copy()
+    df_out = raw[["index", "phantom"]].copy()
     df_out["index"] = pd.to_datetime(df_out["index"], utc=True)
     df_out = df_out.sort_values("index").reset_index(drop=True)
 
@@ -120,7 +109,7 @@ def run(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Gera sku_dates.csv a partir do Seeq")
+    parser = argparse.ArgumentParser(description="Gera sku_dates.csv com Phantom Code do Seeq")
     parser.add_argument(
         "--output",
         default=str(_ROOT / "notebooks" / "sku_dates.csv"),
@@ -130,5 +119,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run(output_path=args.output, config_path=args.config)
-    n_skus = result["bag1_sku"].notna().sum()
-    print(f"Salvo: {args.output}  ({len(result):,} linhas | {n_skus:,} com SKU bag1)")
+    n_phantom = result["phantom"].notna().sum()
+    print(f"Salvo: {args.output}  ({len(result):,} linhas | {n_phantom:,} com Phantom Code)")
