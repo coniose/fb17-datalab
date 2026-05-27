@@ -2,27 +2,181 @@
 """
 Run once after cloning to configure your data source.
 Creates config.yaml with workbook ID, the two sealing-force signals,
-the two SKU signals (bag1/bag2), and time window.
+the SKU signals, and trigger parameters.
 
-Usage:
+FAST PATH — one notebook cell, no interaction:
+    from init_project import init_from_url
+    init_from_url("https://kcc.seeq.site/workbook/WORKBOOK-ID/worksheet/WORKSHEET-ID")
+
+    Signal classification is automatic:
+      • Keywords MES / Phantom / Code / SKU / Product → sku_signals
+      • Remaining signals → Forca_A (display order 0), Forca_B (display order 1)
+
+INTERACTIVE PATH — for edge cases:
     python init_project.py
-
-Two search modes for sealing-force signals:
-  [1] Search by name — finds workbooks shared with you (content_filter="all")
-  [2] Browse by folder — navigates your personal folder tree, then selects
-      worksheet and searches signals via spy.search(worksheet.url)
-
-SKU signals:
-  Always configured by pasting the full worksheet URL that contains the
-  product-code signals. spy.search() reads only metadata (IDs/names) —
-  does NOT pull data, so corrupted PI signals na mesma worksheet não causam erro.
+    (two modes: search by workbook name, or browse personal folder tree)
 """
+import re
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 import yaml
 from pathlib import Path
 
 CONFIG_PATH = Path("config.yaml")
+
+_SKU_KEYWORDS = {"mes", "phantom", "code", "sku", "product", "produto", "bagger"}
+
+_DEFAULT_TRIGGER = {
+    "weibull_beta":          1.181,
+    "weibull_eta_h":         1297.0,
+    "boost_sinal":           0.65,
+    "vida_decay_w":          0.8,
+    "limiar_p_risk":         0.48,
+    "limiar_signal_score":   0.22,
+    "idade_minima_dias":     15,
+    "proj_48h_limiar":       800.0,
+    "sustentacao_proj_dias": 2,
+    "cooldown_h":            48,
+    "snooze_dias":           5,
+    "aviso_p_risk":          0.35,
+    "aviso_signal":          0.15,
+    "aviso_cooldown_h":      72,
+    "risco_forca_limiar":    800.0,
+    "risco_mediana_ok":      950.0,
+    "risco_n_max":           1,
+    "risco_cooldown_h":      48,
+    "critico_forca_min":     800.0,
+    "critico_p_risk_min":    0.40,
+    "critico_cooldown_h":    48,
+    "emergencial_min_eventos": 3,
+    "emergencial_idade_frac":  0.85,
+    "emergencial_p_risk_min":  0.40,
+    "emergencial_cooldown_h":  48,
+    "revisao_marcos_dias":   [20, 25, 35],
+}
+
+
+def _classify_display_items(display_df):
+    """Separa sinais de força e SKU pelo nome (sem interação do usuário)."""
+    force_rows, sku_rows = [], []
+    for _, row in display_df.iterrows():
+        name_lower = str(row.get("Name", "")).lower()
+        if any(kw in name_lower for kw in _SKU_KEYWORDS):
+            sku_rows.append(row)
+        else:
+            force_rows.append(row)
+    return force_rows, sku_rows
+
+
+def _build_config(workbook_id, worksheet_name, force_rows, sku_rows,
+                  time_delta_days=1460, iqr_multiplier=1.0):
+    signals_cfg = [
+        {"id": force_rows[0]["ID"], "name": "Forca_A",
+         "original_name": force_rows[0]["Name"], "type": "Signal"},
+        {"id": force_rows[1]["ID"], "name": "Forca_B",
+         "original_name": force_rows[1]["Name"], "type": "Signal"},
+    ]
+    sku_cfg = [
+        {"id": r["ID"], "name": f"bag{i}_sku",
+         "original_name": r["Name"], "type": "Signal"}
+        for i, r in enumerate(sku_rows[:2], 1)
+    ]
+    return {
+        "project": {
+            "workbook_id":    workbook_id,
+            "worksheet_name": worksheet_name,
+            "time_delta_days": time_delta_days,
+        },
+        "signals":     signals_cfg,
+        "sku_signals": sku_cfg,
+        "preprocessing": {
+            "delta_col_a":    "Forca_A",
+            "delta_col_b":    "Forca_B",
+            "iqr_multiplier": iqr_multiplier,
+        },
+        "trigger": _DEFAULT_TRIGGER,
+    }
+
+
+# ── FAST PATH: init_from_url ──────────────────────────────────────────────────
+
+def init_from_url(worksheet_url: str, config_path: str = "config.yaml",
+                  time_delta_days: int = 1460, iqr_multiplier: float = 1.0):
+    """Gera config.yaml a partir do URL direto do workbook/worksheet.
+
+    Uso (única célula de notebook — spy já autenticado pelo kernel):
+        from init_project import init_from_url
+        init_from_url("https://kcc.seeq.site/workbook/XXXX/worksheet/YYYY")
+
+    Classificação automática:
+      • Nome contém MES / Phantom / Code / SKU / Product → sku_signals
+      • Demais sinais → Forca_A (1º no display) e Forca_B (2º no display)
+    """
+    from seeq import spy
+
+    m = re.search(r'/workbook/([^/?#\s]+)/worksheet/([^/?#\s]+)', worksheet_url)
+    if not m:
+        raise ValueError(
+            "URL não reconhecido. Formato esperado:\n"
+            "  https://kcc.seeq.site/workbook/WORKBOOK-ID/worksheet/WORKSHEET-ID"
+        )
+
+    workbook_id  = m.group(1)
+    worksheet_id = m.group(2)
+
+    print(f"Workbook:  {workbook_id}")
+    print(f"Worksheet: {worksheet_id}")
+    print("Puxando sinais via spy.workbooks.pull() ...")
+
+    wbs = spy.workbooks.pull(workbook_id, include_referenced_workbooks=False, quiet=True)
+    ws  = next(
+        (s for s in wbs[0].worksheets if s.id.upper() == worksheet_id.upper()),
+        None,
+    )
+    if ws is None:
+        raise ValueError(f"Worksheet '{worksheet_id}' não encontrada no workbook.")
+
+    print(f"Worksheet: {ws.name!r}")
+
+    df = ws.display_items
+    force_rows, sku_rows = _classify_display_items(df)
+
+    print(f"\nClassificação automática:")
+    print(f"  Força  ({len(force_rows)} sinais):")
+    for r in force_rows:
+        print(f"    [{force_rows.index(r)}] {r['Name']}  →  {r['ID']}")
+    print(f"  SKU    ({len(sku_rows)} sinais):")
+    for r in sku_rows:
+        print(f"    {r['Name']}  →  {r['ID']}")
+
+    if len(force_rows) < 2:
+        raise ValueError(
+            f"Esperava ≥ 2 sinais de força, encontrou {len(force_rows)}.\n"
+            "Verifique os nomes dos sinais ou use init_project.py interativo."
+        )
+    if not sku_rows:
+        print("\n⚠  Nenhum sinal SKU detectado. Normalização por produto desativada.")
+
+    config = _build_config(
+        workbook_id, ws.name, force_rows, sku_rows,
+        time_delta_days=time_delta_days, iqr_multiplier=iqr_multiplier,
+    )
+
+    with open(Path(config_path), "w", encoding="utf-8") as f:
+        yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+    print(f"\n✓ {config_path} criado.")
+    print(f"  Forca_A  : {config['signals'][0]['id']}")
+    print(f"  Forca_B  : {config['signals'][1]['id']}")
+    for s in config['sku_signals']:
+        print(f"  {s['name']:8}: {s['id']}")
+    print("\nPróximos passos:")
+    print("  1. Gerar troca_modulo.csv (SAP IW38 → extrair_troca_modulo.py)")
+    print("  2. notebooks/00_gerar_hour_prev.ipynb — validar pull dos sinais")
+    return config
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def ask(prompt, default=None):
@@ -359,43 +513,15 @@ def main():
         project_section["worksheet_name"] = worksheet_name
 
     config = {
-        "project": project_section,
-        "signals": signals,
+        "project":     project_section,
+        "signals":     signals,
         "sku_signals": sku_signals,
         "preprocessing": {
             "delta_col_a":    "Forca_A",
             "delta_col_b":    "Forca_B",
             "iqr_multiplier": iqr_mult,
         },
-        # Parâmetros do motor de gatilho v2.2 — calibrados sobre 26 ciclos FB14.
-        # Ajuste apenas se houver evidência estatística (backtest) que justifique.
-        "trigger": {
-            # Weibull — não alterar sem refit sobre novos ciclos históricos
-            "weibull_beta":           1.181,
-            "weibull_eta_h":          1297.0,   # horas = 54.05 dias
-            # p_risk = age_risk + (1 - age_risk) × signal_score × boost_sinal
-            "boost_sinal":            0.65,
-            # RED: todas as condições simultâneas (C1 AND C2 AND C3 AND C4)
-            "limiar_p_risk":          0.48,     # C1
-            "limiar_signal_score":    0.22,     # C2
-            "idade_minima_dias":      15,       # C3 — acomodamento inicial do rolo
-            "proj_48h_limiar":        800.0,    # C4 — gate de força projetada (N)
-            "sustentacao_proj_dias":  2,        # C4 — mínimo de dias abaixo (janela 5d)
-            "cooldown_h":             48,
-            "snooze_dias":            5,
-            # Ajuste de vida pelo ano vigente: V = Eta - (d × w)
-            # 0.0 = só Weibull | 1.0 = só média do ano | 0.8 recomendado
-            "vida_decay_w":           0.8,
-            # AMARELO — aviso precoce (C1_am OR C2_am)
-            "amarelo_p_risk":         0.35,
-            "amarelo_signal":         0.15,
-            "amarelo_cooldown_h":     72,
-            # EMERGÊNCIA — chequemate de força crítica
-            "forca_min_emergencia":   800.0,    # N — mínimo nos últimos 3 dias
-            "emergencia_cooldown_h":  48,
-            # REVISÃO — marcos automáticos de ciclo
-            "revisao_marcos_dias":    [20, 25, 35],
-        },
+        "trigger": _DEFAULT_TRIGGER,
     }
 
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
