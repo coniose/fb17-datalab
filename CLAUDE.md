@@ -38,6 +38,29 @@ Notebooks em ordem para refresh completo:
 
 `pipeline_producao.ipynb` orquestra os passos 1–4 mais a avaliação de gatilhos como um único job Seeq.
 
+## Setup pós-clone (notebooks não versionados)
+
+Os notebooks contêm `MAQUINA = 'FB14'` herdado do fb14. Após `git pull` no servidor, corrija as 2 células abaixo:
+
+**`notebooks/04_pipeline_mensageria.ipynb` — célula 1:**
+```python
+# Substitua:
+MAQUINA = 'FB14'
+# Por:
+from src.connector import load_maquina
+MAQUINA = load_maquina()   # lê project.maquina do config.yaml
+```
+
+**`notebooks/04_pipeline_mensageria.ipynb` — célula 13:**
+```python
+# Substitua:
+state_atual = Path('state_fb14.json')
+# Por:
+state_atual = Path(f'state_{MAQUINA.lower()}.json')
+```
+
+`load_maquina()` lê `project.maquina` do `config.yaml`. O `config.yaml` no servidor já tem `maquina: "FB17"` se gerado via `init_from_url()` (versão ≥ d86e99d+). Se não tiver, adicione manualmente uma linha `maquina: "FB17"` na seção `project:`.
+
 ## Arquivos de dados (não versionados)
 
 Os CSVs são gerados pelo pipeline e **não estão no repositório**. Após clone, executar o pipeline completo para gerá-los:

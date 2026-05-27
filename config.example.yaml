@@ -4,6 +4,7 @@
 project:
   workbook_id: "YOUR-WORKBOOK-ID-HERE"
   worksheet_name: "YOUR-WORKSHEET-NAME-HERE"
+  maquina: "FB17"          # Nome da máquina — usado nos alertas do Teams e no state file
   time_delta_days: 1460   # 4 years
 
 signals:
