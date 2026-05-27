@@ -18,7 +18,8 @@ INTERACTIVE PATH — for edge cases:
 """
 import re
 import sys
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 import yaml
 from pathlib import Path
 
@@ -144,8 +145,8 @@ def init_from_url(worksheet_url: str, config_path: str = "config.yaml",
 
     print(f"\nClassificação automática:")
     print(f"  Força  ({len(force_rows)} sinais):")
-    for r in force_rows:
-        print(f"    [{force_rows.index(r)}] {r['Name']}  →  {r['ID']}")
+    for i, r in enumerate(force_rows):
+        print(f"    [{i}] {r['Name']}  →  {r['ID']}")
     print(f"  SKU    ({len(sku_rows)} sinais):")
     for r in sku_rows:
         print(f"    {r['Name']}  →  {r['ID']}")
