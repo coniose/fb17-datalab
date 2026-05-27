@@ -73,15 +73,30 @@ def run(
     time_delta_days = cfg.get("project", {}).get("time_delta_days", 1460)
     user_tz = spy.utils.get_user_timezone(spy.session)
     end_time = pd.Timestamp.now(tz=user_tz)
-    start_time = end_time - pd.Timedelta(days=time_delta_days)
 
-    raw = spy.pull(
-        items_df,
-        start=start_time.isoformat(),
-        end=end_time.isoformat(),
-        grid="1h",
-        header="ID",
-    ).reset_index()
+    # PI Historian pode ter registros corrompidos em períodos antigos (-11002).
+    # Tenta janelas progressivamente menores até obter dados.
+    _fallback_days = [time_delta_days, 730, 365, 180, 90]
+    raw = None
+    for days in _fallback_days:
+        start_time = end_time - pd.Timedelta(days=days)
+        try:
+            raw = spy.pull(
+                items_df,
+                start=start_time.isoformat(),
+                end=end_time.isoformat(),
+                grid="1h",
+                header="ID",
+                quiet=True,
+            ).reset_index()
+            if days < time_delta_days:
+                print(f"      ⚠ PI Archive Error — janela reduzida para {days} dias")
+            break
+        except Exception as e:
+            if days == _fallback_days[-1]:
+                raise
+            print(f"      ⚠ Erro ao puxar {days}d ({type(e).__name__}), tentando {_fallback_days[_fallback_days.index(days)+1]}d...")
+            continue
 
     raw = raw.rename(columns=id_to_name)
 
