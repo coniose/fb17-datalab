@@ -533,11 +533,14 @@ class CriticoTrigger(TriggerBase):
                 return "CONFIRMADO"
 
             # Caminho RED (C1 AND C2 AND C3 AND C4)
+            today_str = features.today.isoformat()[:10]
+            proj_val  = round(float(features.proj_48h), 1) if not np.isnan(features.proj_48h) else 9999.0
             window = e.get("proj_window", [])
-            window.append({
-                "date": features.today.isoformat()[:10],
-                "proj": round(float(features.proj_48h), 1) if not np.isnan(features.proj_48h) else 9999.0,
-            })
+            # Sobrescreve entrada do dia (idempotente em múltiplos runs diários)
+            if window and window[-1]["date"] == today_str:
+                window[-1]["proj"] = proj_val
+            else:
+                window.append({"date": today_str, "proj": proj_val})
             e["proj_window"] = window[-5:]
             n_below = sum(1 for d in e["proj_window"] if d["proj"] < self.proj_48h_limiar)
 
