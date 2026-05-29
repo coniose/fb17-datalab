@@ -77,6 +77,7 @@ def run(
     # Tenta janelas progressivamente menores até obter dados
     _fallback_days = [time_delta_days, 730, 365, 180, 90, 60, 30, 14]
     raw = None
+    last_exception = None
     for days in _fallback_days:
         start_time = end_time - pd.Timedelta(days=days)
         try:
@@ -92,10 +93,19 @@ def run(
                 print(f"      ⚠ PI Archive corrompido — janela reduzida para {days} dias")
             break
         except Exception as e:
-            if days == _fallback_days[-1]:
-                raise
-            print(f"      ⚠ Erro ao puxar {days}d ({type(e).__name__}), tentando próxima janela...")
+            last_exception = e
+            print(f"      ⚠ Erro ao puxar {days}d ({type(e).__name__}): {e}, tentando próxima janela...")
             continue
+
+    if raw is None:
+        print("❌ Não foi possível puxar dados do Phantom Code em nenhuma janela de tempo.")
+        print("Verifique se o sinal está disponível no PI e se não há corrupção no período solicitado.")
+        # Retorna DataFrame vazio com as colunas esperadas
+        df_out = pd.DataFrame(columns=["index", "phantom"])
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        df_out.to_csv(output_path, index=False)
+        return df_out
 
     # Renomeia a coluna do ID para 'phantom'
     raw = raw.rename(columns={phantom_id: "phantom"})
