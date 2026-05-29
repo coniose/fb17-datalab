@@ -123,6 +123,7 @@ class TriggerEvent:
 @dataclass
 class TriggerFeatures:
     today: pd.Timestamp
+    troca_date: pd.Timestamp
     age_days: float
     mean_3d: float
     mean_14d: float
@@ -149,6 +150,7 @@ class TriggerFeatures:
 def _default_state(maquina: str) -> dict:
     return {
         "maquina": maquina,
+        "cycle_start": None,
         "eventos_risco_ciclo": 0,
         "risco":  {"sp_id": None, "last_fired": None},
         "critico": {
@@ -401,7 +403,7 @@ class TriggerBase(ABC):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RiscoTrigger(TriggerBase):
-    """Leitura anômala isolada — g/f < 800 N, isolada, sinal geral saudável."""
+    """Qualquer leitura de força abaixo do limiar — disparo incondicional por escopo do projeto."""
     name      = "RISCO"
     severity  = "INFO"
     state_key = "risco"
@@ -409,16 +411,14 @@ class RiscoTrigger(TriggerBase):
     def __init__(self, cfg: dict) -> None:
         super().__init__(cfg)
         self.forca_limiar = float(cfg.get("risco_forca_limiar", RISCO_FORCA_LIMIAR))
-        self.mediana_ok   = float(cfg.get("risco_mediana_ok",   RISCO_MEDIANA_OK))
-        self.n_max        = int(cfg.get("risco_n_max",          RISCO_N_MAX))
         self.cooldown_h   = float(cfg.get("risco_cooldown_h",   RISCO_COOLDOWN_H))
 
     def check(self, features: TriggerFeatures, state: dict) -> bool:
         if np.isnan(features.min_3d) or features.min_3d >= self.forca_limiar:
             return False
-        if features.n_leituras_abaixo_800 > self.n_max:
-            return False
-        if np.isnan(features.mediana_3d) or features.mediana_3d <= self.mediana_ok:
+        # Ignorar leituras de ciclos anteriores que ainda aparecem na janela de 3 dias
+        from datetime import date as _date
+        if _date.fromisoformat(features.data_forca_min) < features.troca_date.date():
             return False
         if _in_cooldown(state[self.state_key].get("last_fired"), self.cooldown_h, features.today):
             return False
@@ -429,9 +429,8 @@ class RiscoTrigger(TriggerBase):
         evento_n = state.get("eventos_risco_ciclo", 0) + 1
         min_str  = f"{features.min_3d:.0f}" if not np.isnan(features.min_3d) else "N/D"
         acao = (
-            f"Ir verificar no local — analisar ultima amostra ({min_str} N) e identificar causa. "
-            f"Se 2+ leituras abaixo de {self.forca_limiar:.0f} N nas proximas 72h, "
-            "o sistema escalara para CRITICO."
+            f"Verificar leitura de {min_str} N registrada em {features.data_forca_min}. "
+            f"Limiar operacional FB14: {self.forca_limiar:.0f} N."
         )
         return TriggerEvent(
             maquina          = maquina,
@@ -525,10 +524,13 @@ class CriticoTrigger(TriggerBase):
         # CONFIRMADO
         if not _in_cooldown(e.get("last_fired_confirmado"), self.confirmado_cooldown, features.today):
             # Caminho força crítica
+            from datetime import date as _date
+            _min_no_ciclo = _date.fromisoformat(features.data_forca_min) >= features.troca_date.date()
             if (not np.isnan(features.min_3d)
                     and features.min_3d < self.forca_critica_min
                     and features.p_risk >= self.forca_critica_p_risk
                     and features.age_days >= 5
+                    and _min_no_ciclo
                     and not self._is_outlier(features)):
                 return "CONFIRMADO"
 
@@ -692,6 +694,17 @@ class TriggerEngine:
         else:
             today = _to_utc(today).normalize()
         troca_date = _to_utc(troca_date).normalize()
+
+        # Auto-reset: nova troca detectada no CSV → fechar ciclo anterior e reiniciar
+        stored = self.state.get("cycle_start")
+        if stored is not None and troca_date > _to_utc(stored).normalize():
+            logger.info(
+                "Nova troca detectada (%s → %s) — reiniciando ciclo automaticamente.",
+                _to_utc(stored).date(), troca_date.date(),
+            )
+            self.close_all_by_troca(sp_client=sp_client, list_name=list_name)
+        self.state["cycle_start"] = troca_date.isoformat()
+
         age_days   = float((today - troca_date).days)
 
         eta_ajustado_dias = (
@@ -720,6 +733,7 @@ class TriggerEngine:
 
         features = TriggerFeatures(
             today                 = today,
+            troca_date            = troca_date,
             age_days              = age_days,
             mean_3d               = mean_3d,
             mean_14d              = mean_14d,

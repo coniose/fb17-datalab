@@ -47,9 +47,10 @@ Os CSVs são gerados pelo pipeline e **não estão no repositório**. Após clon
 | `troca_modulo.csv` | `python extrair_troca_modulo.py --iw38 iw38.csv` (geração manual via SAP IW38) |
 | `00_hour_prev.csv` | `00_gerar_hour_prev.ipynb` |
 | `01_vida_rul.csv` | `01_vida_rul.ipynb` |
+| `01_weibull_params.json` | `01_vida_rul.ipynb` (parâmetros Weibull calibrados) |
 | `02_sinais_forca.csv` | `02_sinais_forca.ipynb` |
 | `03_padroes.csv` | `03_padroes_pretroca.ipynb` |
-| `state_fb14.json` | Gerado automaticamente pelo `TriggerEngine` na primeira execução |
+| `state_fb14.json` | Gerado automaticamente pelo `TriggerEngine` na primeira execução (em `notebooks/`) |
 
 ## Architecture
 
@@ -68,46 +69,62 @@ Seeq (Forca_A, Forca_B signals)
 
 | Module | Role |
 |---|---|
-| `trigger_engine.py` | Core engine (v2.3). `TriggerEngine.evaluate()` computes `p_risk` e dispara alertas multi-nível via arquitetura OO: **OUTLIER_SINAL → EMERGENCIA → RED → AMARELO → REVISAO** |
+| `trigger_engine.py` | Core engine (v4.0). `TriggerEngine.evaluate()` computes `p_risk` e dispara alertas via dois gatilhos OO: **RISCO** e **CRITICO** (com sub-níveis `AVISO`, `CONFIRMADO`, `FIM_DE_VIDA`) |
+| `connector.py` | `load_config()` lê `config.yaml`; `pull_data()` chama `spy.pull()` com os IDs do config |
+| `preprocessing.py` | `add_media()` — média de Forca_A/B; `filter_delta_outliers()` — filtro IQR no Delta_AB |
 | `predictor.py` | `build_rul_target()` (assign `target_rul` from swap dates), `load_troca_dates()` |
-| `sku_normalizer.py` | `normalizar_media()` — normalizes `Media` by SKU weight to remove Simpson's Paradox; produces `Media_norm` |
+| `sku_normalizer.py` | `normalizar_media()` — normalizes `Media` by SKU weight to remove Simpson's Paradox; produces `Media_norm`. Catálogo estático `SKU_CATALOG` + calibração automática por phantom via `calibrar_fatores_phantom()` |
 | `proj_forca.py` | `adicionar_proj_48h_backtest()` — OLS regression for force projection, age-gated at ≥ 20 days |
 | `sharepoint_methods.py` | `SharePointClient` — CRUD against SharePoint REST API |
-| `card_formatter.py` | `build_alert_card()` — generates Adaptive Card JSON for Teams |
+| `card_formatter.py` | `build_risco_card()` e `build_critico_card()` — generate Adaptive Card JSON for Teams |
+| `features.py` | `build_features()` — rolling mean, std e slope por janela (7d, 14d) para cada sinal |
 | `generators/` | Pure-function generators called by `pipeline_producao.ipynb` |
 
-### Trigger engine logic (`trigger_engine.py` v2.3)
+### Trigger engine logic (`trigger_engine.py` v4.0)
 
 `p_risk = age_risk + (1 − age_risk) × signal_score × boost_sinal`
 
 - **age_risk**: Weibull CDF(age_days) — calibrated on genuine cycles (target_rul < 20 h at swap)
-- **signal_score**: degradation from `mean_3d / mean_14d` ratio + slope trend
+- **signal_score**: `deg_signal × 0.6 + slope_danger × 0.4` onde `deg_signal = 1 − mean_3d/mean_14d`
 
-**Arquitetura OO:** cada gatilho é uma subclasse de `TriggerBase` com `check()`, `build_event()` e `update_state()`. `TriggerEngine` itera `self.triggers: List[TriggerBase]` — adicionar ou remover um gatilho é uma linha. Features são computadas uma vez por tick e passadas via `TriggerFeatures` (dataclass).
+**Arquitetura OO:** dois gatilhos concretos herdam de `TriggerBase`. `TriggerEngine` itera `self.triggers: List[TriggerBase]` — adicionar um gatilho é uma linha. Features são computadas uma vez por tick e passadas via `TriggerFeatures` (dataclass).
 
 Trigger conditions (evaluated in priority order):
-| Trigger | Condition | Severity |
-|---|---|---|
-| OUTLIER_SINAL | `min_3d < 800 N` AND `n_leituras_abaixo ≤ 1` AND `mediana_3d > 950 N` — leitura isolada que se recupera | INFO |
-| EMERGENCIA | `min_3d < 800 N` AND NOT condição de outlier acima (força crítica confirmada) | CRITICA |
-| RED | C1: `p_risk ≥ 0.48` AND C2: `signal_score ≥ 0.22` AND C3: `age ≥ 15d` AND C4: `proj_48h < 800 N` por ≥ 2 dias | ALTA |
-| AMARELO | `p_risk ≥ 0.35` OR `signal_score ≥ 0.15` (aviso precoce) | MEDIA |
-| REVISAO | Marco automático nos dias 20, 25, 35 do ciclo | INFO |
+| Gatilho | Sub-nível | Condição | Severidade |
+|---|---|---|---|
+| RISCO | — | `min_3d < 800 N` — disparo incondicional; qualquer leitura abaixo do limiar gera registro no SharePoint (cooldown 48 h para evitar spam) | INFO |
+| CRITICO | FIM_DE_VIDA | `age_days ≥ eta_ajustado − 5d` (prioridade máxima, ignora snooze) | CRITICA |
+| CRITICO | CONFIRMADO | `p_risk ≥ 0.48` AND `signal_score ≥ 0.22` AND `age ≥ 15d` AND `proj_48h < 800 N` por ≥ 2 dias **OU** `min_3d < 800 N` AND `p_risk ≥ 0.40` AND não é outlier isolado | ALTA |
+| CRITICO | AVISO | `p_risk ≥ 0.35` OR `signal_score ≥ 0.15` (AND age ≥ 15d, AND não já CONFIRMADO) | MEDIA |
 
-OUTLIER_SINAL e EMERGENCIA são **mutuamente exclusivos** por condição — nunca disparam juntos.
+RISCO e CRITICO podem disparar simultaneamente para o mesmo evento — RISCO como registro operacional obrigatório, CRITICO como escalação de severidade. `_is_outlier` no `CriticoTrigger` (interno, usa `risco_n_max` e `risco_mediana_ok` do config) decide se o sub-800 é isolado o suficiente para não escalar para CRITICO/CONFIRMADO.
 
-Pesquisa histórica (26 ciclos): 81 % dos eventos `Media < 800 N` são transientes — o sinal recupera e o time continuou operando (mediana de 34 dias até a próxima troca). Classificar todos como EMERGENCIA gera fadiga de alerta.
+`eta_ajustado` é recalculado a cada ciclo: `Eta − (d × vida_decay_w)` onde `d = Eta_dias − mean_vida_ano_vigente`. Isso adapta o limiar de FIM_DE_VIDA ao desempenho real do ano corrente.
 
-State is persisted per-machine in `state_fb14.json`. Cooldowns: RED 48 h, AMARELO 72 h, EMERGENCIA 48 h, OUTLIER_SINAL 48 h; snooze 5 days after operator OK.
+State is persisted per-machine in `notebooks/state_fb14.json`. Cooldowns: CONFIRMADO 48 h, AVISO 72 h, FIM_DE_VIDA 48 h, RISCO 48 h; snooze 5 days after operator OK. Public API: `evaluate()`, `close_all_by_troca()`, `snooze()`, `compute_p_risk_snapshot()`.
 
 All trigger thresholds are overridable via `config.yaml` under the `trigger:` key.
+
+### Notebooks de análise / desenvolvimento
+
+Os notebooks `05_*`, `06_*`, `07_*` e `10_*` são ferramentas de pesquisa e diagnóstico, **não fazem parte do pipeline de produção**:
+
+| Notebook | Finalidade |
+|---|---|
+| `05_simulador_ciclo.ipynb` | Simulação de cenários de degradação |
+| `05_swap_analysis.ipynb` | Análise histórica de trocas |
+| `06_modelo_estatistico.ipynb` | Experimentos de modelagem |
+| `06_retrospectiva_mensagens.ipynb` | Backtest de alertas históricos |
+| `06_teste_visual_cards.ipynb` | Preview visual dos Adaptive Cards |
+| `07_sku_ajuste.ipynb` | Calibração de fatores SKU |
+| `10_story_dashboard.ipynb` | Dashboard narrativo para stakeholders |
 
 ### Configuration
 
 - `config.yaml` — Seeq signal IDs, Weibull parameters, all trigger thresholds (não versionado — copiar de `config.example.yaml`)
 - `troca_modulo.csv` — ground truth swap dates; column `Data-base do inicio` (não versionado — gerar via `extrair_troca_modulo.py`)
 - `sharepoint.ev` — credentials: `SP_USER=`, `SP_PASS=` (não versionado)
-- `state_fb14.json` — live engine state (last fired timestamps, snooze window, proj_window) (não versionado — gerado automaticamente)
+- `notebooks/state_fb14.json` — live engine state (last fired timestamps, snooze window, proj_window) (não versionado — gerado automaticamente com migração automática de versões anteriores)
 
 ### SharePoint — lista `Gatilhos_Selagem`
 
@@ -125,4 +142,4 @@ O Power Automate monitora novos itens na lista e posta o `TeamsPayload` (Adaptiv
 
 ### SKU normalization
 
-When `Media_norm` coverage ≥ 50%, the trigger engine uses `media_col="Media_norm"` for degradation scoring. The EMERGENCIA and OUTLIER_SINAL gates always use raw `Media` regardless — they are absolute force thresholds, not relative ones.
+When `Media_norm` coverage ≥ 50%, the trigger engine uses `media_col="Media_norm"` for degradation scoring. The RISCO and CRITICO/CONFIRMADO (força crítica path) gates always use raw `Media` regardless — they are absolute force thresholds, not relative ones. `sku_normalizer.py` suporta dois modos: catálogo estático `SKU_CATALOG` (por código de produto) e calibração automática por phantom code via `normalizar_media_phantom()`.

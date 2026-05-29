@@ -72,7 +72,7 @@ trigger:
   # ── Gatilho CRITICO — força crítica confirmada (ALTA) ─────────────────────
   # Força < limiar + p_risk ≥ mínimo + evento NÃO isolado.
   critico_forca_min:  800.0     # N — força mínima absoluta
-  critico_p_risk_min: 0.40      # p_risk mínimo para escalar de RISCO para CRITICO
+  critico_p_risk_min: 0.30      # p_risk mínimo para escalar de RISCO para CRITICO
   critico_cooldown_h: 48        # horas de silêncio entre alertas CRITICO
 
   # ── Gatilho EMERGENCIAL — avaliação cumulativa (CRITICA) ──────────────────
