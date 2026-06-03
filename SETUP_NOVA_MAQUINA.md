@@ -3,6 +3,74 @@
 Guia de implementação para Claude Code configurar o sistema de manutenção preditiva em uma nova máquina.
 Siga os passos em ordem. Não avance para o próximo passo sem confirmar que o anterior foi concluído.
 
+> **Nota para o agente:** Este repositório é a instalação de referência (FB14). Ao adaptar para
+> uma nova máquina (FB17, FB22…), **nunca sobrescreva** `config.yaml` nem `init_project.ipynb`
+> desta instalação. Clone o repositório em um diretório separado (`fb17-datalab/`) e edite apenas
+> os arquivos listados no Passo 2. Os arquivos centrais desta instalação são referência de produção
+> e não devem ser alterados por automações de setup de outra máquina.
+
+---
+
+## Arquitetura de dados: dois workbooks Seeq
+
+O pipeline FB14 lê dados de **dois workbooks Seeq distintos**. Cada nova máquina precisará
+identificar os equivalentes em seu ambiente:
+
+### Workbook 1 — Força e Phantom (selagem)
+
+Contém os sinais de força de selagem e o código de produto (Phantom/SKU):
+
+| Sinal | Padrão de nome FB14 | Descrição |
+|---|---|---|
+| Forca_A | `BRSZ FB14*Forca*A*` | Força lado A do rolo maintacker |
+| Forca_B | `BRSZ FB14*Forca*B*` | Força lado B do rolo maintacker |
+| Phantom | `BRSZ FB14*Phantom*` ou `*product*code*` | Código do SKU em produção |
+
+O **Workbook ID** deste workbook é gravado em `config.yaml` → `project.workbook_id` pelo
+`init_project.ipynb`. Ele é usado por todos os generators (`gen_hour_prev`, `gen_sinais`, etc.).
+
+### Workbook 2 — Delay, Bagger e Waste (contexto operacional)
+
+Contém os sinais de estado operacional da linha usados pelo `anomaly_delay.ipynb`:
+
+| Sinal | Padrão de nome FB14 | Descrição |
+|---|---|---|
+| Delay calculado | `BRSZ FB14*B1*Tempo Delay Calculado*` | Minutos de parada acumulados |
+| Waste | `BRSZ FB14*B1*Waste*` ou `*refugo*` | Contagem de eventos de refugo |
+| Fault code | `BRSZ FB14*B1*Fault*` ou `*codigo*falha*` | Código de falha ativo |
+
+O **Workbook ID** deste segundo workbook é gravado em `config.yaml` → `project.delay_workbook_id`
+pelo `init_project.ipynb` (cell 7–9, seção "Workbook de Delay"). Ele alimenta exclusivamente
+`anomaly_delay.ipynb` e não é necessário para o pipeline de força rodar.
+
+> **FB17 — PENDENTE:** O Workbook ID do workbook de delay da FB17 ainda não foi identificado.
+> Antes de executar `anomaly_delay.ipynb` na FB17, abrir o Seeq Data Lab, localizar o workbook
+> que contém os sinais de Delay/Bagger/Waste da FB17 e registrar o ID em:
+> `config.yaml → project.delay_workbook_id`. O pipeline de força (Workbook 1) pode rodar
+> normalmente enquanto isso — `anomaly_delay.ipynb` simplesmente não executará até que
+> `delay_workbook_id` seja preenchido.
+
+---
+
+## Relação entre os workbooks e os notebooks
+
+```
+Workbook 1 (Força/Phantom)
+  └─ init_project.ipynb → config.yaml (project.workbook_id)
+       └─ gen_hour_prev → gen_vida_rul → gen_sinais → gen_padroes
+            └─ pipeline_producao.ipynb (TriggerEngine → SharePoint)
+            └─ 04_pipeline_mensageria.ipynb (backtest + diagnóstico)
+
+Workbook 2 (Delay/Bagger/Waste)
+  └─ init_project.ipynb → config.yaml (project.delay_workbook_id)
+       └─ anomaly_delay.ipynb → anomaly_delay.csv
+            └─ pipeline_producao.ipynb (df_delay → age_risk_corrected + quality_weight)
+            └─ 04_pipeline_mensageria.ipynb (df_delay → backtest com correção)
+```
+
+**O pipeline de força é independente do workbook de delay.** Se `anomaly_delay.csv` não existir,
+o `TriggerEngine` usa automaticamente o `age_risk` bruto sem correção (fallback transparente).
+
 ---
 
 ## Contexto do sistema
@@ -13,19 +81,23 @@ quando os sinais indicam degradação. A cadência de troca do rolo segue uma di
 historicamente por máquina.
 
 ```
-Seeq (Forca_A, Forca_B, Phantom)
-  └─ pipeline_producao.ipynb  [roda a cada 1h via spy.jobs.schedule]
-       ├─ Generators: extrai, processa, calcula features
-       ├─ TriggerEngine: avalia RISCO / CRITICO → dispara se condição atendida
-       └─ SharePoint → Power Automate → Teams Adaptive Card
+Seeq (Forca_A, Forca_B, Phantom)           Seeq (Delay, Waste, Fault)
+  └─ pipeline_producao.ipynb [1h]              └─ anomaly_delay.ipynb [manual/diário]
+       ├─ Generators: extrai, processa               └─ anomaly_delay.csv
+       ├─ TriggerEngine v4.0:                              ↓ df_delay (opcional)
+       │    age_risk_corrected (se df_delay)    ──────────┘
+       │    quality_weight gate (CONFIRMADO)
+       │    RISCO / CRITICO → SharePoint
+       └─ Power Automate → Teams Adaptive Card
 
 04_pipeline_mensageria.ipynb  [uso manual]
-  └─ Backtest histórico de gatilhos + diagnóstico do ciclo atual
+  └─ Backtest histórico de gatilhos + diagnóstico do ciclo atual (usa df_delay se disponível)
 ```
 
-**Dois arquivos que o operador mantém manualmente:**
+**Três arquivos que o operador mantém manualmente:**
 - `troca_modulo.csv` — data de cada troca do rolo (ground truth do ciclo)
 - `sharepoint.ev` — credenciais SharePoint (nunca versionado)
+- `config.yaml` — IDs dos sinais Seeq e parâmetros do engine (gerado por `init_project.ipynb`, depois editado)
 
 ---
 
@@ -105,6 +177,34 @@ project:
 ```
 
 Se `project.maquina` não corresponder ao nome definido no Passo 2, corrigir manualmente.
+
+---
+
+## Passo 3-B — Identificar o Workbook de Delay (contexto operacional)
+
+Este passo é **independente** do Passo 3. O pipeline de força funciona sem ele. Mas para ativar
+a correção de `age_risk` por paradas e o filtro de `quality_weight`, o segundo workbook precisa
+ser registrado.
+
+1. No Seeq Data Lab, abrir o workbook que contém os sinais de delay/bagger/waste da máquina.
+2. Copiar o **Workbook ID** da URL: `https://kcc.seeq.site/.../workbook/**<ID>**/...`
+3. Adicionar ao `config.yaml`:
+   ```yaml
+   project:
+     workbook_id: "..."          # já preenchido pelo Passo 3
+     delay_workbook_id: "XXXX-XXXX-XXXX"   # ← preencher aqui
+   ```
+4. Abrir `notebooks/anomaly_delay.ipynb` e verificar a cell de configuração:
+   ```python
+   WORKBOOK_ID_DELAY = cfg["project"]["delay_workbook_id"]
+   ```
+5. Executar `anomaly_delay.ipynb` no browser do Seeq Data Lab (requer sessão `spy` autenticada).
+   O notebook gera `notebooks/anomaly_delay.csv` com `stopped_h`, `age_effective_h`, `quality_weight`.
+6. A partir da próxima execução, `pipeline_producao.ipynb` detecta o CSV e ativa a correção
+   automaticamente — sem nenhuma alteração adicional de código.
+
+> **FB17 — PENDENTE:** `delay_workbook_id` ainda não foi identificado para FB17.
+> Executar os passos 1–3 acima antes de rodar `anomaly_delay.ipynb`.
 
 ---
 

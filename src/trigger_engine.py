@@ -142,6 +142,7 @@ class TriggerFeatures:
     eta_ajustado_dias: float
     data_forca_min: str
     forca_min_ciclo: float
+    quality_weight: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,6 +301,14 @@ def _weibull_age_risk(age_days: float, beta: float = WEIBULL_BETA,
     return float(1.0 - np.exp(-((age_days / eta_d) ** beta)))
 
 
+def _compute_stopped_h(df_delay: pd.DataFrame, troca_date: pd.Timestamp,
+                        today: pd.Timestamp) -> float:
+    """Retorna horas paradas acumuladas no ciclo atual (stopped_h é cumulativo no CSV)."""
+    mask = (df_delay.index >= troca_date) & (df_delay.index <= today + _DAY_END)
+    sub = df_delay.loc[mask, "stopped_h"]
+    return float(sub.max()) if not sub.empty else 0.0
+
+
 def _min_slope_ciclo(df: pd.DataFrame, col: str,
                      cycle_start: pd.Timestamp, today: pd.Timestamp) -> float:
     """Pior slope (mais negativo) de 7 dias observado desde cycle_start."""
@@ -430,7 +439,7 @@ class RiscoTrigger(TriggerBase):
         min_str  = f"{features.min_3d:.0f}" if not np.isnan(features.min_3d) else "N/D"
         acao = (
             f"Verificar leitura de {min_str} N registrada em {features.data_forca_min}. "
-            f"Limiar operacional FB14: {self.forca_limiar:.0f} N."
+            f"Limiar operacional: {self.forca_limiar:.0f} N."
         )
         return TriggerEvent(
             maquina          = maquina,
@@ -488,6 +497,7 @@ class CriticoTrigger(TriggerBase):
         # FIM_DE_VIDA
         self.fim_de_vida_antes   = float(cfg.get("fim_de_vida_dias_antes", FIM_DE_VIDA_DIAS_ANTES))
         self.fim_de_vida_cooldown= float(cfg.get("fim_de_vida_cooldown_h", FIM_DE_VIDA_COOLDOWN_H))
+        self.quality_weight_hold = float(cfg.get("quality_weight_hold_threshold", 0.5))
 
         self._sub_nivel: Optional[str] = None
 
@@ -531,7 +541,8 @@ class CriticoTrigger(TriggerBase):
                     and features.p_risk >= self.forca_critica_p_risk
                     and features.age_days >= 5
                     and _min_no_ciclo
-                    and not self._is_outlier(features)):
+                    and not self._is_outlier(features)
+                    and features.quality_weight <= self.quality_weight_hold):
                 return "CONFIRMADO"
 
             # Caminho RED (C1 AND C2 AND C3 AND C4)
@@ -687,6 +698,7 @@ class TriggerEngine:
         today: Optional[pd.Timestamp] = None,
         media_col: str = "Media",
         troca_dates: Optional[list] = None,
+        df_delay: Optional[pd.DataFrame] = None,
     ) -> List[TriggerEvent]:
         """Avalia todos os gatilhos para `today`."""
         if today is None:
@@ -728,8 +740,20 @@ class TriggerEngine:
         slope_min      = _min_slope_ciclo(df_hourly, media_col, troca_date, today)
         proj_48h       = _compute_proj_48h(mean_3d, slope)
         sig_score      = _compute_signal_score(mean_3d, mean_14d, slope_min)
-        age_risk       = _weibull_age_risk(age_days, self.weibull_beta, self.weibull_eta_d)
+        if df_delay is not None and "stopped_h" in df_delay.columns:
+            stopped_h = _compute_stopped_h(df_delay, troca_date, today)
+            age_effective_h = max(0.0, age_days * 24.0 - stopped_h)
+            age_risk = _weibull_age_risk(age_effective_h / 24.0, self.weibull_beta, self.weibull_eta_d)
+        else:
+            age_risk = _weibull_age_risk(age_days, self.weibull_beta, self.weibull_eta_d)
         p_risk         = age_risk + (1.0 - age_risk) * sig_score * self.boost_sinal
+
+        quality_weight = 0.0
+        if df_delay is not None and "quality_weight" in df_delay.columns:
+            _t = _align_tz(today, df_delay.index)
+            _qw_sub = df_delay.loc[df_delay.index <= _t + _DAY_END, "quality_weight"]
+            if not _qw_sub.empty:
+                quality_weight = float(_qw_sub.iloc[-1])
 
         features = TriggerFeatures(
             today                 = today,
@@ -752,6 +776,7 @@ class TriggerEngine:
             eta_ajustado_dias     = eta_ajustado_dias,
             data_forca_min        = data_forca_min,
             forca_min_ciclo       = forca_min_ciclo,
+            quality_weight        = quality_weight,
         )
 
         fired: List[TriggerEvent] = []
