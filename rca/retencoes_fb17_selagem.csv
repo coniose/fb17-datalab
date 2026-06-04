@@ -1,0 +1,6 @@
+data,descricao,qtd_retida,forca_min_14d,coberto_algoritmo
+2025-04-19,Comprimento Selagem Frontal,240,706.4,True
+2025-05-21,Embalagem Secundária - Selagem Ruim,2100,570.2,True
+2025-06-14,Força de Selagem da Orelha Traseira,1119,627.9,True
+2025-09-06,Força de Selagem da Orelha Traseira,210,784.8,False
+2026-01-04,Embalagem Secundária - Selagem Ruim (queima),120,868.2,False
