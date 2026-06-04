@@ -5,9 +5,16 @@ Roda o TriggerEngine em modo dry-run (sp_client=None) contra dados históricos
 e avalia cada configuração de parâmetros contra eventos de retenção conhecidos
 (ground truth).
 
-Métrica principal:
+Métricas principais:
     advance_days — quantos dias antes da retenção o primeiro alerta disparou.
-    Um valor positivo significa que o sistema teria alertado antes do problema.
+    score        — cobertura ponderada por peso × antecedência − penalidade FP.
+
+Pesos por tipo_crucial (coluna no CSV de retenções):
+    confirmado  → 2.0  (custo alto; degradação óbvia que gerou retenção)
+    aviso       → 1.5  (aproximação fim-de-vida com degradação notória)
+    risco       → 1.0  (base, escalada por qtd_retida / max_qtd)
+    fim_de_vida → 1.0  (previsível pelo Weibull)
+    outro       → 1.0
 
 Uso rápido:
     from src.param_tuner import ParamTuner, DEFAULT_GRID
@@ -23,7 +30,8 @@ Uso personalizado:
         df_hourly     = pd.read_csv("notebooks/00_hour_prev.csv", parse_dates=["Timestamp"]),
         troca_dates   = [...],          # list[pd.Timestamp]
         retention_events = [            # ground truth
-            {"data": "2025-05-21", "descricao": "Selagem Ruim", "qtd_retida": 2100},
+            {"data": "2025-05-21", "descricao": "Selagem Ruim", "qtd_retida": 2100,
+             "tipo_crucial": "confirmado"},
         ],
         config_path   = "config.yaml",
         media_col     = "Media",
@@ -43,6 +51,15 @@ import pandas as pd
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Multiplicadores por tipo_crucial
+_TIPO_PESO: dict[str, float] = {
+    "confirmado":  2.0,
+    "aviso":       1.5,
+    "risco":       1.0,
+    "fim_de_vida": 1.0,
+    "outro":       1.0,
+}
 
 # ── Grid padrão de parâmetros a testar ────────────────────────────────────────
 DEFAULT_GRID: dict[str, list] = {
@@ -71,7 +88,8 @@ class ParamTuner:
         """
         df_hourly         — DataFrame com coluna Timestamp (index ou coluna) + Media
         troca_dates       — list[pd.Timestamp] das trocas confirmadas (UTC)
-        retention_events  — list[dict] com chaves: data (str), descricao, qtd_retida
+        retention_events  — list[dict] com chaves: data (str), descricao, qtd_retida,
+                            tipo_crucial (opcional: risco|aviso|confirmado|fim_de_vida|outro)
         config_path       — caminho para config.yaml (lê parâmetros base)
         media_col         — coluna de força a usar ('Media' ou 'Media_norm')
         janela_pre_evento — dias antes de um evento que um alerta é considerado TP
@@ -96,11 +114,13 @@ class ParamTuner:
             for t in troca_dates
         ]
 
-        # Normalizar eventos de retenção
-        self._retention_events = [
+        # Normalizar eventos de retenção + calcular pesos
+        events_norm = [
             {**ev, "ts": pd.Timestamp(ev["data"], tz="UTC")}
             for ev in retention_events
+            if not str(ev.get("data", "")).startswith("#")  # ignora linhas-comentário
         ]
+        self._retention_events = self._assign_weights(events_norm)
 
     # ── Fábrica conveniente ───────────────────────────────────────────────────
 
@@ -120,17 +140,25 @@ class ParamTuner:
         Defaults:
             hourly_csv    → notebooks/00_hour_prev.csv
             troca_csv     → notebooks/troca_modulo.csv
-            retention_csv → rca/retencoes_fb17_selagem.csv
+            retention_csv → rca/retencoes_<maquina>_selagem.csv
         """
         from src.predictor import load_troca_dates
 
-        hourly_path    = Path(hourly_csv    or ROOT / "notebooks" / "00_hour_prev.csv")
-        troca_path     = Path(troca_csv     or ROOT / "notebooks" / "troca_modulo.csv")
-        retention_path = Path(retention_csv or ROOT / "rca" / "retencoes_fb17_selagem.csv")
+        hourly_path = Path(hourly_csv or ROOT / "notebooks" / "00_hour_prev.csv")
+        troca_path  = Path(troca_csv  or ROOT / "notebooks" / "troca_modulo.csv")
+
+        # auto-detect retention CSV se não fornecido
+        if retention_csv is None:
+            cfg_path = Path(config_path or ROOT / "config.yaml")
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            maquina = cfg["project"]["maquina"].lower()
+            retention_csv = ROOT / "rca" / f"retencoes_{maquina}_selagem.csv"
+        retention_path = Path(retention_csv)
 
         df_hourly = pd.read_csv(hourly_path, parse_dates=["Timestamp"])
         troca_dates = load_troca_dates(troca_path)
-        retention_events = pd.read_csv(retention_path).to_dict("records")
+        retention_events = pd.read_csv(retention_path, comment="#").to_dict("records")
 
         return cls(
             df_hourly=df_hourly,
@@ -151,9 +179,11 @@ class ParamTuner:
             n_disparos          — total de alertas disparados no histórico
             true_positives      — retenções cobertas por alerta prévio
             false_positives     — alertas sem retenção associada
+            coverage_pct        — % de eventos cobertos (não ponderada)
+            weighted_score      — score ponderado por tipo_crucial
             advance_days_mean   — antecedência média (dias) dos TPs
             advance_days_min    — antecedência mínima dos TPs
-            score               — métrica composta (TP coverage × antecedência)
+            score               — alias de weighted_score (para ordenação)
             detalhes            — list[dict] por evento de retenção
         """
         from src.trigger_engine import TriggerEngine
@@ -188,9 +218,7 @@ class ParamTuner:
         return self._score(alertas, params)
 
     def grid_search(self, param_grid: dict[str, list] | None = None) -> pd.DataFrame:
-        """
-        Testa todas as combinações do param_grid e retorna DataFrame ranqueado.
-        """
+        """Testa todas as combinações do param_grid e retorna DataFrame ranqueado."""
         grid = param_grid or DEFAULT_GRID
         keys   = list(grid.keys())
         combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -231,17 +259,43 @@ class ParamTuner:
                 cfg["trigger"][k] = v
         return cfg
 
+    @staticmethod
+    def _assign_weights(events: list[dict]) -> list[dict]:
+        """
+        Calcula peso final de cada evento:
+          peso = tipo_mult × (qtd_retida / max_qtd)   se qtd_retida disponível
+          peso = tipo_mult                             caso contrário
+        """
+        qtds = [float(ev["qtd_retida"]) for ev in events
+                if str(ev.get("qtd_retida", "")).replace(".", "").isdigit()]
+        max_qtd = max(qtds) if qtds else 1.0
+
+        result = []
+        for ev in events:
+            tipo = str(ev.get("tipo_crucial", "outro")).lower().strip()
+            tipo_mult = _TIPO_PESO.get(tipo, 1.0)
+
+            try:
+                qtd_norm = float(ev["qtd_retida"]) / max_qtd
+            except (KeyError, TypeError, ValueError):
+                qtd_norm = 1.0
+
+            result.append({**ev, "_peso": round(tipo_mult * qtd_norm, 4)})
+        return result
+
     def _score(self, alertas: list[pd.Timestamp], params: dict) -> dict:
-        """Cruza alertas disparados com eventos de retenção e calcula métricas."""
-        detalhes = []
+        """Cruza alertas com eventos de retenção e calcula métricas ponderadas."""
+        detalhes: list[dict] = []
         tp_advances: list[float] = []
+        tp_pesos:    list[float] = []
         alertas_usados: set[int] = set()
+        soma_pesos = sum(ev["_peso"] for ev in self._retention_events) or 1.0
 
         for ev in self._retention_events:
-            ts_ev   = ev["ts"]
+            ts_ev      = ev["ts"]
             janela_ini = ts_ev - pd.Timedelta(days=self._janela)
+            peso       = ev["_peso"]
 
-            # alertas que precedem o evento dentro da janela
             pre = [
                 (i, a) for i, a in enumerate(alertas)
                 if janela_ini <= a < ts_ev and i not in alertas_usados
@@ -250,35 +304,44 @@ class ParamTuner:
                 idx_alerta, primeiro_alerta = pre[0]
                 advance = (ts_ev - primeiro_alerta).days
                 tp_advances.append(float(advance))
+                tp_pesos.append(peso)
                 alertas_usados.add(idx_alerta)
                 detalhes.append({
-                    "evento":    ev["data"],
-                    "descricao": ev.get("descricao", ""),
-                    "qtd":       ev.get("qtd_retida", "?"),
-                    "coberto":   True,
-                    "advance_d": advance,
+                    "evento":          ev["data"],
+                    "descricao":       ev.get("descricao", ""),
+                    "qtd":             ev.get("qtd_retida", "?"),
+                    "tipo_crucial":    ev.get("tipo_crucial", "outro"),
+                    "peso":            round(peso, 3),
+                    "coberto":         True,
+                    "advance_d":       advance,
                     "primeiro_alerta": primeiro_alerta.date().isoformat(),
                 })
             else:
                 detalhes.append({
-                    "evento":    ev["data"],
-                    "descricao": ev.get("descricao", ""),
-                    "qtd":       ev.get("qtd_retida", "?"),
-                    "coberto":   False,
-                    "advance_d": None,
+                    "evento":          ev["data"],
+                    "descricao":       ev.get("descricao", ""),
+                    "qtd":             ev.get("qtd_retida", "?"),
+                    "tipo_crucial":    ev.get("tipo_crucial", "outro"),
+                    "peso":            round(peso, 3),
+                    "coberto":         False,
+                    "advance_d":       None,
                     "primeiro_alerta": None,
                 })
 
-        n_ev       = len(self._retention_events)
-        n_tp       = len(tp_advances)
-        n_fp       = len(alertas) - len(alertas_usados)
-        adv_mean   = sum(tp_advances) / len(tp_advances) if tp_advances else 0.0
-        adv_min    = min(tp_advances) if tp_advances else 0.0
-        coverage   = n_tp / n_ev if n_ev else 0.0
+        n_ev    = len(self._retention_events)
+        n_tp    = len(tp_advances)
+        n_fp    = len(alertas) - len(alertas_usados)
+        adv_mean = sum(tp_advances) / len(tp_advances) if tp_advances else 0.0
+        adv_min  = min(tp_advances) if tp_advances else 0.0
+        coverage = n_tp / n_ev if n_ev else 0.0
 
-        # Score: cobertura × antecedência média (normalizada por 14d) − penalidade FP
-        fp_penalty = min(n_fp * 0.02, 0.30)
-        score      = coverage * min(adv_mean / 14.0, 1.0) - fp_penalty
+        # Score ponderado: Σ(peso_i × advance_factor_i) / Σ(pesos) − penalidade FP
+        weighted_num = sum(
+            p * min(adv / 14.0, 1.0)
+            for p, adv in zip(tp_pesos, tp_advances)
+        )
+        fp_penalty     = min(n_fp * 0.02, 0.30)
+        weighted_score = weighted_num / soma_pesos - fp_penalty
 
         return {
             "n_disparos":        len(alertas),
@@ -287,6 +350,6 @@ class ParamTuner:
             "coverage_pct":      round(coverage * 100, 1),
             "advance_days_mean": round(adv_mean, 1),
             "advance_days_min":  round(adv_min, 1),
-            "score":             round(score, 4),
+            "score":             round(weighted_score, 4),
             "detalhes":          detalhes,
         }

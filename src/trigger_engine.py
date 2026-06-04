@@ -439,7 +439,7 @@ class RiscoTrigger(TriggerBase):
         min_str  = f"{features.min_3d:.0f}" if not np.isnan(features.min_3d) else "N/D"
         acao = (
             f"Verificar leitura de {min_str} N registrada em {features.data_forca_min}. "
-            f"Limiar operacional: {self.forca_limiar:.0f} N."
+            f"Limiar operacional FB14: {self.forca_limiar:.0f} N."
         )
         return TriggerEvent(
             maquina          = maquina,
@@ -669,13 +669,13 @@ class TriggerEngine:
     Ordem de avaliação: RISCO → CRITICO (FIM_DE_VIDA > CONFIRMADO > AVISO)
     """
 
-    def __init__(self, maquina: str, state_path: Path) -> None:
+    def __init__(self, maquina: str, state_path: Path, config: dict | None = None) -> None:
         self.maquina    = maquina
         self.state_path = Path(state_path)
         self.state      = _load_state(self.state_path, maquina)
         self.state["maquina"] = maquina
 
-        cfg = _load_trigger_config(self.state_path)
+        cfg = config.get("trigger", {}) if config is not None else _load_trigger_config(self.state_path)
 
         self.weibull_beta  = float(cfg.get("weibull_beta",  WEIBULL_BETA))
         self.weibull_eta_h = float(cfg.get("weibull_eta_h", WEIBULL_ETA_H))

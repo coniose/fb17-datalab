@@ -1,0 +1,56 @@
+project:
+  workbook_id: 0F14732A-4A28-FFD0-82B4-0AFD16024E6D
+  worksheet_name: FB17
+  worksheet_id: 0F148C10-61CB-EA30-80F7-6A20F43D0430
+  maquina: FB17
+  delay_workbook_id: 0F116FED-4C4F-FD60-9EA0-0CA92EE4B765
+  delay_worksheet_id: 0F1174EF-9DD1-66A0-BF31-E53E6548CD7B
+  time_delta_days: 1460
+signals:
+- id: D3DB6716-C46D-4A54-8990-C32ECEE9E5FE
+  name: Forca_A
+  original_name: BRSZ FB17 Quality - FB17_8102_A1_Força Sel Frontal
+  type: Signal
+- id: 55D2EF3F-D680-4D70-9F36-04F1A9584FB4
+  name: Forca_B
+  original_name: BRSZ FB17 Quality - FB17_8102_A1_Força Sel Frontal
+  type: Signal
+phantom_signals:
+- id: 622FA918-C37A-4D57-AFBB-D0D1E6025687
+  name: phantom
+  original_name: BRSZ_FB17_MES_Phantom_Code
+  type: Signal
+preprocessing:
+  delta_col_a: Forca_A
+  delta_col_b: Forca_B
+  iqr_multiplier: 1.0
+trigger:
+  weibull_beta: 1.181
+  weibull_eta_h: 1297.0
+  boost_sinal: 0.65
+  vida_decay_w: 0.8
+  limiar_p_risk: 0.48
+  limiar_signal_score: 0.22
+  idade_minima_dias: 15
+  proj_48h_limiar: 800.0
+  sustentacao_proj_dias: 2
+  cooldown_h: 48
+  snooze_dias: 5
+  aviso_p_risk: 0.35
+  aviso_signal: 0.15
+  aviso_cooldown_h: 72
+  risco_forca_limiar: 800.0
+  risco_mediana_ok: 950.0
+  risco_n_max: 1
+  risco_cooldown_h: 48
+  critico_forca_min: 800.0
+  critico_p_risk_min: 0.3
+  critico_cooldown_h: 48
+  emergencial_min_eventos: 3
+  emergencial_idade_frac: 0.85
+  emergencial_p_risk_min: 0.4
+  emergencial_cooldown_h: 48
+  revisao_marcos_dias:
+  - 20
+  - 25
+  - 35
