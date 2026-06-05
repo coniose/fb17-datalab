@@ -84,6 +84,7 @@ class ParamTuner:
         config_path: str | Path | None = None,
         media_col: str = "Media",
         janela_pre_evento: int = 21,
+        df_delay: "pd.DataFrame | None" = None,
     ) -> None:
         """
         df_hourly         — DataFrame com coluna Timestamp (index ou coluna) + Media
@@ -93,12 +94,14 @@ class ParamTuner:
         config_path       — caminho para config.yaml (lê parâmetros base)
         media_col         — coluna de força a usar ('Media' ou 'Media_norm')
         janela_pre_evento — dias antes de um evento que um alerta é considerado TP
+        df_delay          — anomaly_delay.csv para corrigir horas paradas no Weibull
         """
         self._config_path = Path(config_path or ROOT / "config.yaml")
         self._base_cfg    = self._load_config()
         self._maquina     = self._base_cfg["project"]["maquina"]
         self._media_col   = media_col
         self._janela      = janela_pre_evento
+        self._df_delay    = df_delay
 
         # Normalizar df_hourly
         df = df_hourly.copy()
@@ -130,6 +133,7 @@ class ParamTuner:
         hourly_csv:        str | Path | None = None,
         troca_csv:         str | Path | None = None,
         retention_csv:     str | Path | None = None,
+        delay_csv:         str | Path | None = None,
         config_path:       str | Path | None = None,
         media_col:         str = "Media",
         janela_pre_evento: int = 21,
@@ -141,6 +145,7 @@ class ParamTuner:
             hourly_csv    → notebooks/00_hour_prev.csv
             troca_csv     → notebooks/troca_modulo.csv
             retention_csv → rca/retencoes_<maquina>_selagem.csv
+            delay_csv     → notebooks/anomaly_delay.csv (opcional — corrige horas paradas)
         """
         from src.predictor import load_troca_dates
 
@@ -160,6 +165,13 @@ class ParamTuner:
         troca_dates = load_troca_dates(troca_path)
         retention_events = pd.read_csv(retention_path, comment="#").to_dict("records")
 
+        # Carrega anomaly_delay se disponível
+        df_delay = None
+        delay_path = Path(delay_csv or ROOT / "notebooks" / "anomaly_delay.csv")
+        if delay_path.exists():
+            df_delay = pd.read_csv(delay_path, index_col="Timestamp", parse_dates=True)
+            df_delay.index = pd.to_datetime(df_delay.index, utc=True)
+
         return cls(
             df_hourly=df_hourly,
             troca_dates=troca_dates,
@@ -167,6 +179,7 @@ class ParamTuner:
             config_path=config_path,
             media_col=media_col,
             janela_pre_evento=janela_pre_evento,
+            df_delay=df_delay,
         )
 
     # ── API pública ───────────────────────────────────────────────────────────
@@ -174,6 +187,10 @@ class ParamTuner:
     def backtest(self, params: dict[str, Any]) -> dict:
         """
         Roda o TriggerEngine em dry-run com os parâmetros dados e retorna métricas.
+
+        Itera ciclo a ciclo (reset de estado entre trocas) e usa a troca ativa
+        correta para cada dia — necessário para calcular age_risk com precisão.
+        Passa df_delay quando disponível para corrigir horas paradas no Weibull.
 
         Returns dict com:
             n_disparos          — total de alertas disparados no histórico
@@ -188,32 +205,67 @@ class ParamTuner:
         """
         from src.trigger_engine import TriggerEngine
 
-        cfg = self._patch_config(params)
-        state_tmp = Path(tempfile.mktemp(suffix=".json"))
+        cfg       = self._patch_config(params)
+        alertas:  list[pd.Timestamp] = []
 
-        try:
-            engine  = TriggerEngine(self._maquina, state_tmp, config=cfg)
-            dias    = pd.DatetimeIndex(sorted({ts.normalize() for ts in self._df.index}))
-            alertas: list[pd.Timestamp] = []
+        # Itera cada ciclo completo (troca[i] → troca[i+1])
+        for i, (t_ini, t_fim) in enumerate(zip(self._troca_dates[:-1], self._troca_dates[1:])):
+            ciclo_df = self._df[(self._df.index >= t_ini) & (self._df.index < t_fim)]
+            if ciclo_df.empty:
+                continue
 
-            for day in dias:
-                df_ate = self._df[self._df.index <= day + pd.Timedelta(hours=23, minutes=59)]
-                try:
-                    evs = engine.evaluate(
-                        df_hourly  = df_ate,
-                        troca_date = self._troca_dates[-1],
-                        sp_client  = None,
-                        today      = day,
-                        troca_dates= self._troca_dates,
-                        media_col  = self._media_col,
-                    )
-                    for ev in evs:
-                        alertas.append(day)
-                except Exception:
-                    pass
-        finally:
-            if state_tmp.exists():
-                state_tmp.unlink()
+            state_tmp = Path(tempfile.mktemp(suffix=".json"))
+            try:
+                engine = TriggerEngine(self._maquina, state_tmp, config=cfg)
+                dias   = pd.DatetimeIndex(sorted({ts.normalize() for ts in ciclo_df.index}))
+
+                for day in dias:
+                    df_ate = self._df[self._df.index <= day + pd.Timedelta(hours=23, minutes=59)]
+                    try:
+                        evs = engine.evaluate(
+                            df_hourly   = df_ate,
+                            troca_date  = t_ini.to_pydatetime(),
+                            sp_client   = None,
+                            today       = day,
+                            troca_dates = self._troca_dates,
+                            media_col   = self._media_col,
+                            df_delay    = self._df_delay,
+                        )
+                        for _ in evs:
+                            alertas.append(day)
+                    except Exception:
+                        pass
+            finally:
+                if state_tmp.exists():
+                    state_tmp.unlink()
+
+        # Ciclo atual (última troca → hoje) com estado limpo
+        t_ini_atual = self._troca_dates[-1]
+        ciclo_atual = self._df[self._df.index >= t_ini_atual]
+        if not ciclo_atual.empty:
+            state_tmp = Path(tempfile.mktemp(suffix=".json"))
+            try:
+                engine = TriggerEngine(self._maquina, state_tmp, config=cfg)
+                dias   = pd.DatetimeIndex(sorted({ts.normalize() for ts in ciclo_atual.index}))
+                for day in dias:
+                    df_ate = self._df[self._df.index <= day + pd.Timedelta(hours=23, minutes=59)]
+                    try:
+                        evs = engine.evaluate(
+                            df_hourly   = df_ate,
+                            troca_date  = t_ini_atual.to_pydatetime(),
+                            sp_client   = None,
+                            today       = day,
+                            troca_dates = self._troca_dates,
+                            media_col   = self._media_col,
+                            df_delay    = self._df_delay,
+                        )
+                        for _ in evs:
+                            alertas.append(day)
+                    except Exception:
+                        pass
+            finally:
+                if state_tmp.exists():
+                    state_tmp.unlink()
 
         return self._score(alertas, params)
 
