@@ -194,10 +194,27 @@ def run(
     # 4. Refit Weibull sobre durações OPERACIONAIS dos ciclos genuínos
     duracoes_op_h = _detectar_genuinos(df, troca_dates, limiar_genuino_h, df_delay)
     if len(duracoes_op_h) < 3:
-        raise ValueError(
-            f"Apenas {len(duracoes_op_h)} ciclos genuínos detectados — "
-            "insuficiente para ajuste Weibull (mínimo 3)."
-        )
+        # Fallback: relaxa o filtro de genuinidade antes de falhar.
+        # Ocorre quando trocas oportunistas (paradas longas) dominam o histórico
+        # e o limiar configurado é mais estrito que o necessário.
+        duracoes_todos = _detectar_genuinos(df, troca_dates, float("inf"), df_delay)
+        if len(duracoes_todos) >= 3:
+            warnings.warn(
+                f"[gen_vida_rul] Apenas {len(duracoes_op_h)} ciclos genuínos "
+                f"(limiar={limiar_genuino_h}h). Usando todos os "
+                f"{len(duracoes_todos)} ciclos disponíveis para ajuste Weibull. "
+                "Considere aumentar limiar_genuino_h em config.yaml.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            duracoes_op_h = duracoes_todos
+        else:
+            raise ValueError(
+                f"Apenas {len(duracoes_op_h)} ciclos genuínos e "
+                f"{len(duracoes_todos)} ciclos totais — "
+                "insuficiente para ajuste Weibull (mínimo 3). "
+                "Aguarde mais trocas ou revise troca_modulo.csv."
+            )
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
