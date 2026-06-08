@@ -20,6 +20,7 @@ class SharePointClient:
         self.password = password
         self.ctx = self.authenticate()
         self.web = self.ctx.web
+        self._email_cache: dict = {}
 
     def authenticate(self):
         ctx_auth = AuthenticationContext(self.url)
@@ -78,20 +79,24 @@ class SharePointClient:
     def get_person_bad(self, user_param):
         return self.web.site_users.get_by_id(user_param).get().execute_query().properties['Email']
 
-    def get_person(self, user_id, email_cache={}):
-        if user_id in email_cache:
-            return email_cache[user_id]
+    def get_person(self, user_id):
+        # Cache por instância (self._email_cache) — não usar default mutável
+        # como argumento, que vira cache global compartilhado entre instâncias.
+        if user_id in self._email_cache:
+            return self._email_cache[user_id]
         try:
             user_email = self.web.site_users.get_by_id(user_id).get().execute_query().properties['Email']
-            email_cache[user_id] = user_email
+            self._email_cache[user_id] = user_email
             return user_email
         except Exception as e:
             # print(f"Error fetching email for user ID {user_id}: {e}")
             return None
 
     def list_to_dataframe(self, list_name):
-        column_names = self.exclude_system_columns(list_name)
-        return self.query_large_list(list_name, column_names)
+        # query_large_list aceita apenas (list_name) — passar column_names
+        # lançava TypeError. A exclusão de colunas de sistema é responsabilidade
+        # do chamador, se necessária.
+        return self.query_large_list(list_name)
 
     def download_and_read_excel(self, relative_url):
         import warnings

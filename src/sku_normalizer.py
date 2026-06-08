@@ -415,7 +415,11 @@ def normalizar_media_phantom(
     if has_ts_index:
         merged = merged.set_index("ts").sort_index()
 
-    df_forca["phantom_codigo"] = merged["phantom_codigo"].values
-    df_forca["phantom_fator"]  = merged["phantom_fator"].values
-    df_forca["Media_norm"]     = merged["Media_norm"].values
-    return df_forca
+    # Escreve numa cópia (como a irmã `normalizar_media`) — não mutar o
+    # DataFrame do chamador. A ordem de `df_forca` é preservada, então o
+    # alinhamento posicional com `merged.values` é idêntico ao anterior.
+    out = df_forca.copy()
+    out["phantom_codigo"] = merged["phantom_codigo"].values
+    out["phantom_fator"]  = merged["phantom_fator"].values
+    out["Media_norm"]     = merged["Media_norm"].values
+    return out

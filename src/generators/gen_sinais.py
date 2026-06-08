@@ -138,7 +138,10 @@ def run(
     weibull_beta = trig.get("weibull_beta", 1.181)
     weibull_eta_d = trig.get("weibull_eta_h", 1297.0) / 24.0
     boost_sinal   = trig.get("boost_sinal", 0.65)
-    forca_limiar  = trig.get("forca_min_emergencia", 800.0)
+    # Mesma chave que o trigger_engine lê (`risco_forca_limiar`), para que ajustar
+    # o limiar no config.yaml afete motor e generator juntos. Mantém fallback para
+    # a chave legada `forca_min_emergencia`.
+    forca_limiar  = trig.get("risco_forca_limiar", trig.get("forca_min_emergencia", 800.0))
 
     # 1. Carregar e preparar
     df = pd.read_csv(input_path, parse_dates=["Timestamp"])

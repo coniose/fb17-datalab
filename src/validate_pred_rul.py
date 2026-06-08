@@ -30,7 +30,11 @@ def compute_overall_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, f
         "bias_h": float(valid["error_h"].mean()),
         "median_abs_error_h": float(valid["abs_error_h"].median()),
         "mape_pct": float(valid["ape"].mean() * 100),
-        "corr": float(valid[["pred_rul", "target_rul"]].corr().iloc[0, 1]),
+        # corr exige ≥2 linhas válidas; com menos, .corr() produz NaN
+        "corr": (
+            float(valid[["pred_rul", "target_rul"]].corr().iloc[0, 1])
+            if len(valid) >= 2 else float("nan")
+        ),
     }
     return valid, metrics
 
