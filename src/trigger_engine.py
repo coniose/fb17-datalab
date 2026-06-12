@@ -47,6 +47,11 @@ PROJ_48H_LIMIAR       = 800.0
 SUSTENTACAO_PROJ_DIAS = 2
 COOLDOWN_H            = 48
 SNOOZE_DIAS           = 5
+# Rolo recém-instalado não dispara: com < 48h de vida não pode estar degradado nem
+# em fim de vida, e qualquer leitura < 800 nessa janela é quase sempre vazamento do
+# ciclo anterior (a data da troca tem resolução de dia — sinais da madrugada da troca
+# caem na janela de 3 dias). Tunável via config: trigger.idade_minima_disparo_h.
+IDADE_MINIMA_DISPARO_H = 48.0
 
 # AVISO (ex-AMARELO)
 AVISO_P_RISK     = 0.35
@@ -683,6 +688,7 @@ class TriggerEngine:
         self.boost_sinal   = float(cfg.get("boost_sinal",   BOOST_SINAL))
         self.snooze_dias   = int(cfg.get("snooze_dias",     SNOOZE_DIAS))
         self.vida_decay_w  = float(cfg.get("vida_decay_w",  0.8))
+        self.idade_minima_disparo_h = float(cfg.get("idade_minima_disparo_h", IDADE_MINIMA_DISPARO_H))
 
         self.triggers: List[TriggerBase] = [
             RiscoTrigger(cfg),
@@ -718,6 +724,18 @@ class TriggerEngine:
         self.state["cycle_start"] = troca_date.isoformat()
 
         age_days   = float((today - troca_date).days)
+
+        # Guard de ciclo recém-iniciado: suprime todos os disparos enquanto o rolo
+        # tiver < idade_minima_disparo_h de vida. Evita falso disparo por leituras
+        # residuais do ciclo anterior (ver IDADE_MINIMA_DISPARO_H). O ciclo já foi
+        # reiniciado acima; aqui apenas não geramos eventos.
+        if age_days * 24.0 < self.idade_minima_disparo_h:
+            logger.info(
+                "[%s] Ciclo recem-iniciado (age=%.0fh < %.0fh) — disparos suprimidos.",
+                today.date(), age_days * 24.0, self.idade_minima_disparo_h,
+            )
+            _save_state(self.state, self.state_path)
+            return []
 
         eta_ajustado_dias = (
             self._compute_vida_ref_ajustada(troca_dates)
