@@ -30,7 +30,10 @@ from dotenv import dotenv_values
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 
-SP_FILE_PATH  = "/Sites/H945/Suzano/api_csv/projeto_kairos/CONSUMO MAINTACKER BCM.xlsx"
+# Fonte de verdade identificada por GUID (o `sourcedoc=` da URL do SP) — imune a
+# mudança de pasta/caminho. É o mesmo arquivo antes lido por caminho em
+# Suzano/api_csv/projeto_kairos. Consultado a cada execução do job (sem cache local).
+SP_FILE_GUID  = "58F84B76-59C3-4233-BE9F-EBD3D62ECE69"
 SHEET_NAME    = "Trocas Maintacker"
 COL_DATA      = "Data"
 # Contrato §10.1: "Maquina" é o nome canônico atual da coluna de máquina; "Linha"
@@ -86,6 +89,12 @@ def _sp_client(config_path: Path):
             def download_bytes(self, relative_url: str) -> bytes:
                 return _File.open_binary(self._ctx, relative_url).content
 
+            def download_bytes_by_id(self, file_id: str) -> bytes:
+                guid = file_id.strip().strip("{}")
+                f = self._ctx.web.get_file_by_id(guid)
+                content = f.get_content().execute_query()
+                return content.value
+
         return _MinimalClient()
 
 
@@ -110,15 +119,15 @@ def sync_troca_modulo(
 
     if verbose:
         print(f"[sp_troca_sync] Máquina: {maquina}")
-        print(f"[sp_troca_sync] Baixando {SP_FILE_PATH} ...")
+        print(f"[sp_troca_sync] Baixando CONSUMO MAINTACKER BCM.xlsx (GUID {SP_FILE_GUID}) ...")
 
     sp  = _sp_client(config_path)
-    raw = sp.download_bytes(SP_FILE_PATH)
+    raw = sp.download_bytes_by_id(SP_FILE_GUID)
 
     xl  = pd.ExcelFile(io.BytesIO(raw))
     if SHEET_NAME not in xl.sheet_names:
         raise ValueError(
-            f"Sheet '{SHEET_NAME}' não encontrada em {SP_FILE_PATH}.\n"
+            f"Sheet '{SHEET_NAME}' não encontrada no arquivo GUID {SP_FILE_GUID}.\n"
             f"Sheets disponíveis: {xl.sheet_names}"
         )
 
