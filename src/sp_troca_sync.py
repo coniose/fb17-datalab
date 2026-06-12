@@ -33,7 +33,9 @@ from dotenv import dotenv_values
 SP_FILE_PATH  = "/Sites/H945/Suzano/api_csv/projeto_kairos/CONSUMO MAINTACKER BCM.xlsx"
 SHEET_NAME    = "Trocas Maintacker"
 COL_DATA      = "Data"
-COL_MAQUINA   = "Linha"
+# Contrato §10.1: "Maquina" é o nome canônico atual da coluna de máquina; "Linha"
+# é o nome legado (tolerado durante a transição). Leitura por nome, nunca posição.
+COL_MAQUINA_CANDIDATES = ("Maquina", "Linha")
 DEFAULT_TIPO  = "indefinido"
 
 ROOT = Path(__file__).resolve().parents[1]   # raiz do fb14-datalab
@@ -122,14 +124,15 @@ def sync_troca_modulo(
 
     df = xl.parse(SHEET_NAME)
 
-    if COL_DATA not in df.columns or COL_MAQUINA not in df.columns:
+    col_maq = next((c for c in COL_MAQUINA_CANDIDATES if c in df.columns), None)
+    if COL_DATA not in df.columns or col_maq is None:
         raise ValueError(
-            f"Colunas esperadas: '{COL_DATA}', '{COL_MAQUINA}'.\n"
+            f"Colunas esperadas: '{COL_DATA}' + uma de {COL_MAQUINA_CANDIDATES}.\n"
             f"Encontradas: {list(df.columns)}"
         )
 
     # Filtrar pela máquina e preparar saída
-    df_maq = df[df[COL_MAQUINA].str.strip().str.upper() == maquina.upper()].copy()
+    df_maq = df[df[col_maq].astype(str).str.strip().str.upper() == maquina.upper()].copy()
 
     if df_maq.empty:
         raise ValueError(
