@@ -158,6 +158,10 @@ def _default_state(maquina: str) -> dict:
         "maquina": maquina,
         "cycle_start": None,
         "eventos_risco_ciclo": 0,
+        # Marco da última leitura de força já avaliada por um job (high-water mark).
+        # O job roda de hora em hora, mas medições novas chegam esparsas (~12h); este
+        # campo evita reavaliar/redisparar sobre uma leitura que o passado já monitorou.
+        "last_reading_ts": None,
         "risco":  {"sp_id": None, "last_fired": None},
         "critico": {
             "sp_id":                  None,
@@ -430,9 +434,13 @@ class RiscoTrigger(TriggerBase):
     def check(self, features: TriggerFeatures, state: dict) -> bool:
         if np.isnan(features.min_3d) or features.min_3d >= self.forca_limiar:
             return False
-        # Ignorar leituras de ciclos anteriores que ainda aparecem na janela de 3 dias
+        # Ignorar leituras do ciclo anterior E do próprio dia da troca. Nas primeiras
+        # horas de um rolo novo a força é naturalmente baixa/instável (transiente de
+        # partida) e não caracteriza anomalia. troca_date é normalizado para meia-noite,
+        # então a comparação correta nessa resolução é por dia (<=), descartando o dia
+        # da troca inteiro do mínimo que alimenta o RISCO.
         from datetime import date as _date
-        if _date.fromisoformat(features.data_forca_min) < features.troca_date.date():
+        if _date.fromisoformat(features.data_forca_min) <= features.troca_date.date():
             return False
         if _in_cooldown(state[self.state_key].get("last_fired"), self.cooldown_h, features.today):
             return False
@@ -707,8 +715,10 @@ class TriggerEngine:
         df_delay: Optional[pd.DataFrame] = None,
     ) -> List[TriggerEvent]:
         """Avalia todos os gatilhos para `today`."""
+        live_mode = today is None
+        latest_reading_ts = _to_utc(df_hourly.index[-1])   # instante real da última leitura
         if today is None:
-            today = _to_utc(df_hourly.index[-1]).normalize()
+            today = latest_reading_ts.normalize()
         else:
             today = _to_utc(today).normalize()
         troca_date = _to_utc(troca_date).normalize()
@@ -736,6 +746,20 @@ class TriggerEngine:
             )
             _save_state(self.state, self.state_path)
             return []
+
+        # Guardrail de leitura já monitorada (high-water mark): o job roda de hora em
+        # hora, mas medições novas de força de selagem chegam esparsas (~12h). Se a
+        # última leitura disponível não avançou desde o último job que a avaliou, não
+        # reprocessamos — não podemos redisparar sobre dados que o passado já monitorou.
+        # Só vale em modo live; backtests passam `today` explícito e reavaliam livremente.
+        if live_mode and self.state.get("last_reading_ts") is not None:
+            if latest_reading_ts <= _to_utc(self.state["last_reading_ts"]):
+                logger.info(
+                    "[%s] Sem medicao nova de forca desde o ultimo job (ultima=%s) — disparos suprimidos.",
+                    today.date(), latest_reading_ts.isoformat(),
+                )
+                _save_state(self.state, self.state_path)
+                return []
 
         eta_ajustado_dias = (
             self._compute_vida_ref_ajustada(troca_dates)
@@ -804,6 +828,12 @@ class TriggerEngine:
                 trigger.update_state(self.state, ev.data_disparo)
                 self._persist(ev, trigger, features, sp_client, list_name, eta_ajustado_dias)
                 fired.append(ev)
+
+        # Marca esta leitura como avaliada (high-water mark) — só em modo live.
+        # Atualizada aqui, e não nos returns antecipados, para que uma leitura suprimida
+        # pelo guard de idade ainda seja avaliada uma vez quando o rolo amadurecer.
+        if live_mode:
+            self.state["last_reading_ts"] = latest_reading_ts.isoformat()
 
         _save_state(self.state, self.state_path)
 
